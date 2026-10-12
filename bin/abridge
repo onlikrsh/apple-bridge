@@ -58,6 +58,11 @@ Setup
 Apps
   abridge app notes|calendar|reminders
                                    the macOS-style desktop apps (also in your app menu)
+  abridge apps install|remove      add or remove them in your app menu
+
+Pairing
+  abridge pair                     what is paired, and how to pair the rest
+  abridge pair usb|clipboard       pair over USB / pair the clipboard Shortcuts
 
 Everyday
   abridge sync [calendar|reminders|notes]
@@ -646,12 +651,64 @@ find_electron() {
   return 1
 }
 
+cmd_apps() {
+  local apps_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+  local icon_dir="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps"
+  local id
+  case "${1:-install}" in
+    install)
+      mkdir -p "$apps_dir" "$icon_dir"
+      for id in notes calendar reminders; do
+        sed "s|@ABRIDGE@|$ABRIDGE_ROOT/bin/abridge|" "$ABRIDGE_ROOT/share/applications/abridge-$id.desktop" >"$apps_dir/abridge-$id.desktop"
+        cp "$ABRIDGE_ROOT/share/icons/abridge-$id.svg" "$icon_dir/abridge-$id.svg"
+      done
+      have update-desktop-database && update-desktop-database "$apps_dir" >/dev/null 2>&1
+      have gtk-update-icon-cache && gtk-update-icon-cache -q -t "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor" >/dev/null 2>&1
+      ok "Notes, Calendar and Reminders are in your app menu"
+      find_electron >/dev/null || warn "Electron is not installed yet: sudo pacman -S electron"
+      ;;
+    remove)
+      for id in notes calendar reminders; do rm -f "$apps_dir/abridge-$id.desktop" "$icon_dir/abridge-$id.svg"; done
+      ok "removed from the app menu"
+      ;;
+    *) die "usage: abridge apps install|remove" ;;
+  esac
+}
+
+cmd_pair() {
+  case "${1:-}" in
+    usb) cmd_usb pair; return ;;
+    clipboard|clip) cmd_clip pair; return ;;
+    "") ;;
+    *) die "usage: abridge pair [usb|clipboard]" ;;
+  esac
+  mark() { if "$@" >/dev/null 2>&1; then printf '%s✓%s' "$_b" "$_n"; else printf '○'; fi; }
+  line() { printf '  %s %-22s %s\n' "$1" "$2" "$3"; }
+  echo "Your iPhone and this computer"
+  echo
+  line "$(mark test -f "$VDIRSYNCER_CONF")" "iCloud Calendar" "abridge setup calendar"
+  line "$(mark reminders_ready)" "iCloud Reminders" "abridge setup reminders"
+  line "$(mark notes_ready)" "iCloud Notes" "abridge setup notes"
+  line "$(mark systemctl --user is-active --quiet abridge-clip.service)" "Clipboard" "abridge pair clipboard  (then build 2 Shortcuts)"
+  line "$(mark usb_paired)" "USB (photos, backups)" "plug in, unlock, then: abridge pair usb"
+  line "$(mark localsend_installed)" "LocalSend (files)" "install LocalSend on both; same Wi-Fi"
+  line "$(mark apps_installed)" "Desktop apps" "abridge apps install"
+  echo
+  echo "The iCloud parts sync through Apple's servers, so they work anywhere."
+  echo "Clipboard, LocalSend and AirDrop need the iPhone on the same Wi-Fi."
+  echo "Details: $ABRIDGE_ROOT/docs/pairing.md"
+}
+
+usb_paired() { have idevicepair && idevicepair validate >/dev/null 2>&1; }
+localsend_installed() { have localsend_app || have localsend || { have flatpak && flatpak info org.localsend.localsend_app >/dev/null 2>&1; }; }
+apps_installed() { [ -f "${XDG_DATA_HOME:-$HOME/.local/share}/applications/abridge-notes.desktop" ]; }
+
 cmd_app() {
   local name="${1:-}"
   case "$name" in notes|calendar|reminders) ;; *) die "usage: abridge app notes|calendar|reminders" ;; esac
   shift
   local electron
-  electron="$(find_electron)" || die "Electron is not installed. Run: ./install.sh --only apps"
+  electron="$(find_electron)" || die "Electron is not installed. Run: sudo pacman -S electron"
   [ -f "$ABRIDGE_ROOT/apps/dist/main.js" ] || die "the apps are not built: $ABRIDGE_ROOT/apps/dist is missing"
   ABRIDGE_BIN="$ABRIDGE_ROOT/bin/abridge" exec "$electron" "$ABRIDGE_ROOT/apps" --app="$name" "$@"
 }
@@ -792,6 +849,10 @@ cmd_doctor() {
   airdrop_check
   if [ -x "$AIRDROP_DIR/airdrop.sh" ]; then ok "installed"; else warn "not installed (abridge airdrop install)"; fi
 
+  step "Desktop apps"
+  if find_electron >/dev/null; then ok "Electron ($(find_electron))"; else warn "Electron missing (sudo pacman -S electron)"; fi
+  if apps_installed; then ok "in the app menu"; else warn "not in the app menu (abridge apps install)"; fi
+
   step "Clipboard"
   if systemctl --user is-active --quiet abridge-clip.service 2>/dev/null; then ok "clipboard service running"; else warn "off (abridge clip pair)"; fi
 
@@ -817,6 +878,8 @@ main() {
     sync) cmd_sync "$@" ;;
     paths) cmd_paths ;;
     app) cmd_app "$@" ;;
+    apps) cmd_apps "$@" ;;
+    pair) cmd_pair "$@" ;;
     cal|calendar) cmd_cal "$@" ;;
     contacts) cmd_contacts "$@" ;;
     rem|reminders) cmd_rem "$@" ;;

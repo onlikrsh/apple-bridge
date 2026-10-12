@@ -81,6 +81,7 @@ function createWindow() {
     frame: false,
     show: false,
     backgroundColor: nativeTheme.shouldUseDarkColors ? CONF.dark : CONF.light,
+    icon: path.join(__dirname, 'icons', `${NAME}.png`),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,

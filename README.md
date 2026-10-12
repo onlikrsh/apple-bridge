@@ -1,7 +1,14 @@
 # apple-bridge
 
-Make an iPhone and iCloud work with Arch Linux: Calendar, Contacts, Reminders,
-Notes, AirDrop and USB, behind one command, `abridge`.
+Make an iPhone and iCloud work with Arch Linux the way they work with a Mac:
+**Notes, Calendar and Reminders apps** that look and behave like the macOS
+ones and stay in sync with your iPhone, plus Contacts, a one-tap clipboard,
+file transfer, AirDrop and USB, behind one command, `abridge`.
+
+| Notes | Calendar | Reminders |
+|---|---|---|
+| ![Notes](docs/screenshots/notes-light.png) | ![Calendar](docs/screenshots/calendar-week-light.png) | ![Reminders](docs/screenshots/reminders-today-light.png) |
+| ![Notes, dark](docs/screenshots/notes-dark.png) | ![Calendar, month](docs/screenshots/calendar-month-light.png) | ![Reminders, details](docs/screenshots/reminders-info-dark.png) |
 
 Apple publishes no Linux API for most of this. apple-bridge doesn't add more
 reverse engineering. It wires together the open-source projects that already
@@ -22,6 +29,8 @@ protocol.
 | **AirDrop** | AWDL via [OWL] + patched [OpenDrop] ([airdrop-mt7921]) | both ways, ~40–67 kB/s | a MediaTek MT7921/MT7922 Wi-Fi card; AirDrop set to *Everyone* |
 | **Fast file transfer** | [LocalSend] (open protocol, same Wi-Fi) | both ways, full speed | the free LocalSend app on the iPhone |
 | **USB** | [libimobiledevice], [ifuse] | photos and videos to Linux, backups, file browsing | a cable; tap *Trust* once |
+| **Desktop apps** | Electron, macOS-style UI over the above | Notes, Calendar, Reminders: read, write, sync | `pacman -S electron` |
+| **Clipboard** | `abridge clip` + two iPhone Shortcuts | both ways, text and images, one tap (Back Tap) | same Wi-Fi |
 
 What is **not** possible today, and why:
 
@@ -38,6 +47,42 @@ What is **not** possible today, and why:
   are refused rather than risk corrupting the note.
 - **Creating Reminders lists**: Apple's web API has no call for it. Create
   them on the phone.
+- **Automatic Universal Clipboard, Handoff, iMessage, calls**: iOS reserves
+  these for Apple's own devices.
+  [docs/pairing.md](docs/pairing.md#what-cant-be-paired-from-linux) lists
+  what comes closest.
+
+## The apps
+
+Three separate apps, one codebase (`apps/`), in your app menu as **Notes**,
+**Calendar** and **Reminders**. They follow your desktop's light or dark
+theme.
+
+- **Notes**: folders, the date-grouped list (Today, Previous 7 Days, …) and a
+  rich-text editor with Title/Heading/Subheading/Body/Monostyled, lists,
+  round checklists, tables, block quotes and links. Edits save as you type
+  and reach the iPhone a few seconds later. Drag notes onto folders; search
+  covers note text. Notes with attachments are view-only, because icloud-md
+  can't write them back safely.
+- **Calendar**: Day, Week, Month and Year views, a mini month, calendar
+  colours and visibility, and the event inspector (title, location,
+  all-day, times, repeat, alert, calendar, notes, URL). Double-click or
+  drag to create; drag to move; drag the bottom edge to resize. Repeating
+  events ask before changing the series, and can drop a single date.
+- **Reminders**: Today / Scheduled / All / Flagged / Completed and your
+  lists, circle checkboxes, priorities, flags, overdue dates in red,
+  subtasks, inline add, and the (i) details popover.
+
+The look is rebuilt from macOS's published metrics and colours. Apple's own
+assets are not copied: Apple licenses SF Pro, SF Symbols and its app icons
+for Apple platforms only. The apps use **Inter**, the open font closest to
+SF Pro (and SF Pro itself if you've installed it), **Lucide** icons, and
+original app icons.
+
+Keyboard shortcuts are the Mac ones with Ctrl for ⌘: Ctrl+N new,
+Ctrl+F search, Ctrl+R sync, Ctrl+W close, Ctrl+1–4 for Calendar views,
+Ctrl+T today, and in Notes Ctrl+Shift+T/H/J/B/M for paragraph styles and
+Ctrl+Shift+L for a checklist.
 
 ## Install
 
@@ -48,7 +93,10 @@ cd ~/src/apple-bridge
 ```
 
 It installs, with `pacman --needed`: vdirsyncer, khal, khard, todoman, nodejs,
-npm, chromium, libimobiledevice, usbmuxd, ifuse, rsync, libheif and libsecret.
+npm, chromium, libimobiledevice, usbmuxd, ifuse, rsync, libheif, libsecret,
+electron and inter-font (the apps), and wl-clipboard, xclip, qrencode and
+libnotify (the clipboard). The apps are prebuilt in `apps/dist`, so they need
+no npm install.
 pyicloud goes into its own venv and icloud-md into its own npm prefix, both
 under `~/.local/share/apple-bridge`, so nothing touches the system Python or
 global npm. It links `~/.local/bin/abridge`. LocalSend comes from the AUR
@@ -75,8 +123,13 @@ abridge setup calendar       # asks for the app-specific password; --no-contacts
 abridge setup reminders      # Apple ID password + the 6-digit code from your phone
 abridge setup notes          # a browser window opens on icloud.com: sign in there
 abridge timer on             # sync every 15 minutes in the background
+abridge pair                 # what's paired; then: abridge pair clipboard, abridge pair usb
 abridge doctor               # check everything
 ```
+
+Then open **Notes**, **Calendar** and **Reminders** from your app menu
+(`abridge apps install` adds them if the installer didn't). Pairing the
+clipboard, USB and the rest is in [docs/pairing.md](docs/pairing.md).
 
 Reminders and Notes keep **separate** sessions. pyicloud signs in with SRP and
 2FA; icloud-md uses a real browser. When either expires, `abridge doctor`
@@ -84,8 +137,13 @@ says so and names the command to run.
 
 ## Use it
 
+The apps are the everyday way. Everything is also available from the
+terminal:
+
 ```sh
-abridge sync                          # everything, now
+abridge app notes                     # or calendar, reminders (same as the app menu)
+abridge pair clipboard                # scan the QR code with the iPhone, build two Shortcuts
+abridge sync                          # everything, now (or: abridge sync calendar)
 abridge cal                           # next 7 days
 abridge cal list 2026-10-15 30d       # any khal command
 abridge cal printcalendars           # your iCloud calendar names
@@ -150,6 +208,8 @@ and your Wi-Fi stays connected.
 | `~/.local/share/apple-bridge/{calendars,contacts,reminders}/` | synced data, as vdirs of .ics/.vcf |
 | `~/Notes/` | your notes, as Markdown in a git repo |
 | `~/.local/share/apple-bridge/{venv,node,src}/` | pyicloud, icloud-md, airdrop-mt7921 |
+| `~/.config/apple-bridge-{notes,calendar,reminders}/` | the apps' window state and caches |
+| `~/.config/apple-bridge/clip.json` (0600) | the clipboard token and port |
 
 ## Troubleshooting
 
@@ -166,6 +226,12 @@ and your Wi-Fi stays connected.
   `abridge usb pair`. Check `systemctl status usbmuxd`.
 - **HEIC photos don't open**: install `libheif` (installed with the usb part),
   or set the phone's Camera → Formats → *Most Compatible*.
+- **An app won't open**: run it from a terminal to see why, e.g.
+  `abridge app notes`. Is `electron` installed?
+- **Clipboard: "no graphical session"**: start it from your desktop session
+  once with `abridge clip on`. That passes your display to the service.
+- **Clipboard Shortcut fails**: same Wi-Fi? Firewall open on TCP 47100? Did
+  the laptop's IP change? (See [docs/pairing.md](docs/pairing.md#2-clipboard).)
 - **AirDrop finds nothing**: for receiving, keep the phone's share sheet
   **open**. For sending, keep it **closed** and the phone unlocked. AirDrop
   must be on *Everyone for 10 Minutes*, which switches itself off.
@@ -175,7 +241,19 @@ and your Wi-Fi stays connected.
 ```sh
 python -m pytest tests/                   # unit + end-to-end tests, no Apple account needed
 shellcheck install.sh bin/abridge lib/common.sh
+
+cd apps
+npm ci                                    # dev only: Electron, esbuild, TipTap, ical.js, Lucide
+node build.mjs --minify                   # rebuild apps/dist (committed)
+node --test test/*.test.js                # backends; with DISPLAY set also drives the real apps
+node test/screenshots.js /tmp/shots       # the screenshots above, from a demo account
 ```
+
+The app tests run Electron through Playwright against a generated demo
+account (`apps/test/make-fixture.js`), with a fake `abridge`. They check
+that opening a note never rewrites it, that every demo note round-trips
+byte for byte, and that edits, new events, drags and ticks produce exactly
+the expected file changes and `abridge rem` calls.
 
 `tests/test_cli.py` runs `bin/abridge` in a throwaway `$HOME` against a fake
 pyicloud. With the real vdirsyncer, khal, khard and todoman available (on
@@ -188,6 +266,7 @@ accept the generated configs. vdirsyncer even fetches the password through
 All the hard work is upstream:
 [pyicloud] (timlaing), [icloud-md] (coddingtonbear),
 [OWL] and [OpenDrop] (SEEMOO lab, TU Darmstadt),
+[Electron], [TipTap] and [tiptap-markdown], [ical.js], [Lucide] icons, the [Inter] font,
 [airdrop-mt7921] (jedbillyb), [vdirsyncer], [khal], [khard] and [todoman]
 (pimutils), [libimobiledevice], [LocalSend].
 
@@ -203,3 +282,9 @@ All the hard work is upstream:
 [libimobiledevice]: https://libimobiledevice.org
 [ifuse]: https://github.com/libimobiledevice/ifuse
 [LocalSend]: https://localsend.org
+[Electron]: https://www.electronjs.org
+[TipTap]: https://tiptap.dev
+[tiptap-markdown]: https://github.com/aguingand/tiptap-markdown
+[ical.js]: https://github.com/kewisch/ical.js
+[Lucide]: https://lucide.dev
+[Inter]: https://rsms.me/inter/

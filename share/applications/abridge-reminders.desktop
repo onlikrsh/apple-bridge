@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Reminders
+GenericName=Reminders (iCloud)
+Comment=Your iCloud reminders, synced with your iPhone
+Exec=@ABRIDGE@ app reminders
+Icon=abridge-reminders
+Terminal=false
+Categories=Office;ProjectManagement;
+Keywords=reminders;todo;tasks;icloud;apple;iphone;
+StartupWMClass=abridge-reminders
+StartupNotify=true

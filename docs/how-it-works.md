@@ -173,3 +173,43 @@ how long AWDL-based tools keep working. LocalSend doesn't depend on any of it.
 [OpenDrop]: https://github.com/seemoo-lab/opendrop
 [OWL]: https://github.com/seemoo-lab/owl
 [apple_cloud_notes_parser]: https://github.com/threeplanetssoftware/apple_cloud_notes_parser
+
+## The desktop apps
+
+`apps/` is one Electron codebase started as three apps (`--app=notes|calendar|reminders`),
+each with its own window state and single-instance lock. Pages run sandboxed
+with context isolation. Everything that touches files or iCloud is in the
+main process and goes through `abridge`, so the apps, the terminal and the
+sync timer share the same sessions, and one lock per service (`flock`)
+keeps their syncs from overlapping.
+
+- **Notes** reads and writes the icloud-md vault directly. The editor
+  (TipTap) only offers formatting icloud-md can map back to Apple Notes, and
+  the frontmatter that carries each note's identity is split off and
+  re-attached byte for byte with icloud-md's own rules. A note is written
+  only when its Markdown really differs from what was loaded. A write is
+  refused if a pull changed the file in the meantime. Edits are pushed
+  4 seconds after you stop typing.
+- **Calendar** reads and writes vdirsyncer's `.ics` files with ical.js,
+  then runs `abridge sync calendar`. Edits keep every property they don't
+  show (attendees, Apple's `X-` properties), keep an event's time zone when
+  moving it, and bump `SEQUENCE`.
+- **Reminders** calls `abridge rem dump/add/edit/done/rm`, one at a time.
+
+## The clipboard bridge
+
+`libexec/abridge-clipd` is a small HTTP service (stdlib Python, TCP 47100)
+run as a systemd user service:
+
+| Request | Does |
+|---|---|
+| `POST /clipboard` (body = text or `image/*`) | sets this computer's clipboard (`wl-copy` / `xclip`) and shows a notification |
+| `GET /clipboard` | returns this computer's clipboard: text, or an image when that's all there is |
+| `GET /ping` | checks the token |
+| `GET /pair?code=NNNNNN` | the setup page; the code comes from `abridge clip pair` and lasts 10 minutes |
+
+Requests need `Authorization: Bearer <token>`, except `/pair`, which needs
+its code. The service answers only private, loopback and link-local
+addresses. The iPhone side is plain Shortcuts (*Get Clipboard* + *Get
+Contents of URL*, and the reverse), so no app has to be installed. Back Tap
+makes each one a single gesture.

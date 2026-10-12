@@ -17,4 +17,5 @@ for (const app of APPS) {
   await build({ ...common, entryPoints: [`src/ui/${app}/app.js`], outfile: `dist/ui/${app}/app.js`, platform: 'browser', format: 'iife', target: 'chrome120' });
   fs.copyFileSync(`src/ui/${app}/index.html`, `dist/ui/${app}/index.html`);
 }
+fs.cpSync('icons', 'dist/icons', { recursive: true });
 console.log('built', fs.readdirSync('dist/ui').join(', '));

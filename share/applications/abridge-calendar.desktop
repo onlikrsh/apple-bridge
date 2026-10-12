@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Calendar
+GenericName=Calendar (iCloud)
+Comment=Your iCloud calendars, synced with your iPhone
+Exec=@ABRIDGE@ app calendar
+Icon=abridge-calendar
+Terminal=false
+Categories=Office;Calendar;
+Keywords=calendar;events;icloud;apple;iphone;schedule;
+StartupWMClass=abridge-calendar
+StartupNotify=true

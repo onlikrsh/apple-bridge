@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Notes
+GenericName=Notes (iCloud)
+Comment=Your iCloud notes, synced with your iPhone
+Exec=@ABRIDGE@ app notes
+Icon=abridge-notes
+Terminal=false
+Categories=Office;TextEditor;Utility;
+Keywords=notes;icloud;apple;iphone;memo;
+StartupWMClass=abridge-notes
+StartupNotify=true

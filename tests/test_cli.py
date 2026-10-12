@@ -416,3 +416,52 @@ def test_usb_without_a_phone(ab):
     proc = ab.run("usb", "info", ok=False)
     assert proc.returncode == 1
     assert "libimobiledevice" in proc.stderr or "no iPhone found" in proc.stderr
+
+
+# ------------------------------------------------------------- apps & pair
+
+
+def test_paths_is_what_the_apps_read(ab):
+    out = dict(line.split("=", 1) for line in ab.run("paths").stdout.splitlines())
+    assert out["APPLE_ID"] == "me@icloud.com"
+    assert out["NOTES_DIR"] == str(ab.home / "Notes")
+    assert out["CALENDAR_DIR"] == str(ab.data / "calendars")
+
+
+def test_sync_one_part_only(ab):
+    ab.run("setup", "notes", input="n\n")
+    before = git(ab, "log", "--format=%s")
+    proc = ab.run("sync", "reminders")
+    assert "reminders is not set up yet" in proc.stderr
+    assert git(ab, "log", "--format=%s") == before  # notes were not pulled
+    ab.run("sync", "notes")
+    assert git(ab, "log", "-1", "--format=%s").strip() == "Pull from iCloud"
+    assert ab.run("sync", "bogus", ok=False).returncode == 1
+
+
+def test_apps_install_puts_them_in_the_menu(ab):
+    ab.run("apps", "install")
+    apps = ab.home / ".local/share/applications"
+    for app in ("notes", "calendar", "reminders"):
+        entry = (apps / f"abridge-{app}.desktop").read_text()
+        assert f"Exec={ABRIDGE} app {app}" in entry
+        assert f"StartupWMClass=abridge-{app}" in entry
+        assert (ab.home / f".local/share/icons/hicolor/scalable/apps/abridge-{app}.svg").exists()
+    ab.run("apps", "remove")
+    assert not list(apps.glob("abridge-*.desktop"))
+
+
+def test_pair_overview(ab):
+    ab.run("setup", "notes", input="n\n")
+    out = ab.run("pair").stdout
+    assert "iCloud Notes" in out and "abridge pair clipboard" in out
+    notes_line = next(l for l in out.splitlines() if "iCloud Notes" in l)
+    assert "✓" in notes_line
+    assert "○" in next(l for l in out.splitlines() if "iCloud Calendar" in l)
+
+
+def test_app_without_electron_says_how_to_get_it(ab):
+    proc = ab.run("app", "notes", ok=False)
+    if proc.returncode == 0:
+        pytest.skip("electron is installed here")
+    assert "pacman" in proc.stderr or "dist is missing" in proc.stderr

@@ -6,7 +6,8 @@
 #   ./install.sh --only calendar,notes   just those parts
 #   ./install.sh --yes                   no questions (pacman --noconfirm too)
 #
-# Parts: calendar (+contacts), reminders, notes, usb, localsend.
+# Parts: calendar (+contacts), reminders, notes, usb, localsend,
+#        apps (the macOS-style Notes/Calendar/Reminders), clipboard.
 # AirDrop needs particular Wi-Fi hardware and its own sudo rule, so it is a
 # separate step: `abridge airdrop check`, then `abridge airdrop install`.
 set -euo pipefail
@@ -15,7 +16,7 @@ REPO="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 # shellcheck source=lib/common.sh
 . "$REPO/lib/common.sh"
 
-ALL_PARTS="calendar reminders notes usb localsend"
+ALL_PARTS="calendar reminders notes usb localsend apps clipboard"
 PARTS="$ALL_PARTS"
 USE_PACMAN=1
 
@@ -51,6 +52,10 @@ want calendar && packages+=(vdirsyncer khal khard)
 want reminders && packages+=(todoman)
 want notes && packages+=(nodejs npm chromium)
 want usb && packages+=(libimobiledevice usbmuxd ifuse rsync libheif)
+# The apps run on the system Electron (no npm needed: apps/dist is prebuilt).
+# Inter is the open font closest to Apple's SF Pro, which they fall back to.
+want apps && packages+=(electron inter-font)
+want clipboard && packages+=(wl-clipboard xclip qrencode libnotify iproute2)
 
 step "System packages"
 if [ "$USE_PACMAN" = 1 ] && have pacman; then
@@ -149,6 +154,11 @@ case ":$PATH:" in
     ;;
 esac
 
+if want apps; then
+  step "Desktop apps"
+  "$REPO/bin/abridge" apps install
+fi
+
 if want usb; then
   # usbmuxd starts from a udev rule when the phone is plugged in; nothing to
   # enable. Pairing needs the phone unlocked, so it is a later step.
@@ -167,6 +177,8 @@ ${_b}Next steps${_n}
   abridge setup reminders      Reminders (Apple ID password + 2FA code)
   abridge setup notes          Notes, as Markdown files in a git repo
   abridge timer on             keep them in sync every 15 minutes
+  abridge pair                 pair the clipboard, USB and the rest
+  Notes, Calendar, Reminders   open them from your app menu
   abridge airdrop check        can this laptop's Wi-Fi do AirDrop?
   abridge doctor               see what works
 EOF
