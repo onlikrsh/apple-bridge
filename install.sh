@@ -37,6 +37,13 @@ want() { case " $PARTS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
 [ "$(id -u)" != 0 ] || die "run this as your normal user; it uses sudo only for pacman"
 
+# First, so that even if a later step fails, `abridge doctor` is there to
+# say what is missing.
+step "The abridge command"
+mkdir -p "$HOME/.local/bin" "$ABRIDGE_CONFIG_DIR" "$ABRIDGE_DATA_DIR" "$ABRIDGE_STATE_DIR"
+ln -sfn "$REPO/bin/abridge" "$HOME/.local/bin/abridge"
+ok "linked ~/.local/bin/abridge -> $REPO/bin/abridge"
+
 # ---------------------------------------------------------------- packages
 
 packages=(git python libsecret)
@@ -114,19 +121,42 @@ fi
 
 # ---------------------------------------------------------------- abridge
 
-step "The abridge command"
-mkdir -p "$HOME/.local/bin" "$ABRIDGE_CONFIG_DIR" "$ABRIDGE_DATA_DIR" "$ABRIDGE_STATE_DIR"
-ln -sfn "$REPO/bin/abridge" "$HOME/.local/bin/abridge"
-ok "linked ~/.local/bin/abridge -> $REPO/bin/abridge"
+step "PATH"
+# Arch's default shell setup does not put ~/.local/bin on PATH, so `abridge`
+# would be "command not found" right after a successful install.
+PATH_CHANGED=0
 case ":$PATH:" in
-  *":$HOME/.local/bin:"*) ;;
-  *) warn "$HOME/.local/bin is not on your PATH. Add to your shell rc: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+  *":$HOME/.local/bin:"*) ok "$HOME/.local/bin is on your PATH" ;;
+  *)
+    case "${SHELL##*/}" in
+      zsh) rc="$HOME/.zshrc" ;;
+      bash) rc="$HOME/.bashrc" ;;
+      *) rc="" ;;
+    esac
+    if [ -z "$rc" ]; then
+      warn "add $HOME/.local/bin to your PATH (fish: fish_add_path ~/.local/bin)"
+    elif grep -qsF '.local/bin' "$rc"; then
+      ok "$rc already adds ~/.local/bin; open a new terminal to pick it up"
+      PATH_CHANGED=1
+    elif confirm "Add ~/.local/bin to your PATH in $rc?" y; then
+      # shellcheck disable=SC2016  # written literally, expanded by the shell later
+      printf '\n# added by apple-bridge install.sh\nexport PATH="$HOME/.local/bin:$PATH"\n' >>"$rc"
+      ok "added to $rc"
+      PATH_CHANGED=1
+    else
+      warn "add this to $rc yourself: export PATH=\"\$HOME/.local/bin:\$PATH\""
+    fi
+    ;;
 esac
 
 if want usb; then
   # usbmuxd starts from a udev rule when the phone is plugged in; nothing to
   # enable. Pairing needs the phone unlocked, so it is a later step.
   ok "usb: plug the phone in, unlock it, then run: abridge usb pair"
+fi
+
+if [ "${PATH_CHANGED:-0}" = 1 ]; then
+  printf '\n%sOpen a new terminal (or run: source %s) before using abridge.%s\n' "$_b" "$rc" "$_n"
 fi
 
 cat <<EOF
