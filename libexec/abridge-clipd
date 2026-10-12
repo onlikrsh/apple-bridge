@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""Clipboard bridge between an iPhone and this computer.
+
+iOS lets no app read or write the clipboard in the background, so Apple's
+Universal Clipboard can't be rebuilt from outside Apple. The next best thing
+is one tap: two iPhone Shortcuts (put them on Back Tap) talk to this small
+HTTP service on the local network.
+
+  GET  /clipboard   this computer's clipboard (text, or an image)
+  POST /clipboard   set this computer's clipboard (text or image/*)
+  GET  /ping        check the Shortcut's token
+  GET  /pair?code=  the setup page `abridge clip pair` shows as a QR code
+
+Every request needs `Authorization: Bearer <token>` except /pair, which
+needs the short-lived code instead. Only clients on private networks (home
+Wi-Fi, USB tethering, loopback) are answered.
+"""
+
+from __future__ import annotations
+
+import html
+import ipaddress
+import json
+import os
+import secrets
+import shutil
+import subprocess
+import sys
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+MAX_BODY = 25 * 1024 * 1024  # a large photo
+CONFIG_DIR = Path(os.environ.get("ABRIDGE_CONFIG_DIR") or Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "apple-bridge")
+CONFIG = CONFIG_DIR / "clip.json"
+PAIR = CONFIG_DIR / "clip-pair.json"
+DEFAULT_PORT = 47100
+
+
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def ensure_config(port: int | None = None) -> dict:
+    cfg = load_config()
+    changed = False
+    if not cfg.get("token"):
+        cfg["token"] = secrets.token_urlsafe(24)
+        changed = True
+    if port or not cfg.get("port"):
+        cfg["port"] = port or cfg.get("port") or DEFAULT_PORT
+        changed = True
+    if changed:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        old = os.umask(0o077)
+        try:
+            CONFIG.write_text(json.dumps(cfg))
+        finally:
+            os.umask(old)
+    return cfg
+
+
+def client_allowed(addr: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(addr.split("%", 1)[0])
+    except ValueError:
+        return False
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip.is_private or ip.is_loopback or ip.is_link_local
+
+
+# ----------------------------------------------------------------- clipboard
+
+
+class Clipboard:
+    """wl-clipboard on Wayland, xclip (or xsel, text only) on X11."""
+
+    def __init__(self, env: dict | None = None) -> None:
+        self.env = env if env is not None else os.environ
+        path = self.env.get("PATH", os.environ.get("PATH"))
+        self.wayland = bool(self.env.get("WAYLAND_DISPLAY")) and shutil.which("wl-copy", path=path) is not None
+        self.xclip = shutil.which("xclip", path=path) is not None
+        self.xsel = shutil.which("xsel", path=path) is not None
+
+    def available(self) -> str | None:
+        """None when the clipboard can be used, else what to fix."""
+        if self.env.get("WAYLAND_DISPLAY"):
+            return None if self.wayland else "install wl-clipboard (sudo pacman -S wl-clipboard)"
+        if self.env.get("DISPLAY"):
+            return None if (self.xclip or self.xsel) else "install xclip (sudo pacman -S xclip)"
+        return "no graphical session (DISPLAY/WAYLAND_DISPLAY not set); run `abridge clip on` from your desktop"
+
+    def _run(self, args: list[str], data: bytes | None = None) -> bytes:
+        proc = subprocess.run(args, input=data, capture_output=True, timeout=10, env=dict(self.env))
+        if proc.returncode != 0 and data is None:
+            return b""  # an empty clipboard makes the paste tools exit non-zero
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.decode(errors="replace").strip() or f"{args[0]} failed")
+        return proc.stdout
+
+    def types(self) -> list[str]:
+        if self.wayland:
+            out = self._run(["wl-paste", "--list-types"])
+        elif self.xclip:
+            out = self._run(["xclip", "-selection", "clipboard", "-t", "TARGETS", "-o"])
+        else:
+            return ["text/plain"]
+        return [t.strip() for t in out.decode(errors="replace").splitlines() if t.strip()]
+
+    def read(self) -> tuple[bytes, str] | None:
+        types = self.types()
+        has_text = any(t.startswith("text/plain") or t in ("UTF8_STRING", "STRING", "TEXT") for t in types)
+        image = next((t for t in ("image/png", "image/jpeg", "image/heic", "image/gif") if t in types), None)
+        if image and not has_text:
+            data = self._run(["wl-paste", "--no-newline", "--type", image] if self.wayland else ["xclip", "-selection", "clipboard", "-t", image, "-o"])
+            return (data, image) if data else None
+        if self.wayland:
+            data = self._run(["wl-paste", "--no-newline", "--type", "text/plain;charset=utf-8"]) or self._run(["wl-paste", "--no-newline"])
+        elif self.xclip:
+            data = self._run(["xclip", "-selection", "clipboard", "-o"])
+        else:
+            data = self._run(["xsel", "--clipboard", "--output"])
+        return (data, "text/plain; charset=utf-8") if data else None
+
+    def write(self, data: bytes, mime: str) -> None:
+        is_text = mime.startswith("text/") or mime in ("", "application/octet-stream")
+        if self.wayland:
+            args = ["wl-copy"] if is_text else ["wl-copy", "--type", mime]
+        elif self.xclip:
+            args = ["xclip", "-selection", "clipboard", "-i"] if is_text else ["xclip", "-selection", "clipboard", "-t", mime, "-i"]
+        else:
+            if not is_text:
+                raise RuntimeError("images need xclip or wl-clipboard")
+            args = ["xsel", "--clipboard", "--input"]
+        # xclip and wl-copy stay alive to serve the selection: don't wait on them.
+        proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=dict(self.env), start_new_session=True)
+        assert proc.stdin is not None
+        proc.stdin.write(data)
+        proc.stdin.close()
+        try:
+            proc.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def desktop_env() -> dict:
+    """os.environ, plus the display variables the desktop exported to the
+    systemd user session. Started at login, this service can come up before
+    the desktop has shared WAYLAND_DISPLAY/DISPLAY, so look them up per request."""
+    env = dict(os.environ)
+    if env.get("WAYLAND_DISPLAY") or env.get("DISPLAY") or not shutil.which("systemctl"):
+        return env
+    try:
+        out = subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return env
+    for line in out.splitlines():
+        key, _, value = line.partition("=")
+        if key in ("WAYLAND_DISPLAY", "DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS") and key not in env:
+            env[key] = value
+    return env
+
+
+def notify(title: str, body: str) -> None:
+    if shutil.which("notify-send"):
+        subprocess.Popen(["notify-send", "--app-name=apple-bridge", "--icon=edit-paste", title, body[:200]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ---------------------------------------------------------------- pair page
+
+
+def pair_page(base_url: str, token: str) -> str:
+    e = html.escape
+    return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pair your iPhone</title><style>
+body{{font:17px -apple-system,system-ui,sans-serif;margin:0;padding:20px 18px 40px;background:#f2f2f7;color:#1c1c1e}}
+h1{{font-size:28px;margin:8px 0 4px}} h2{{font-size:20px;margin:26px 0 8px}} p{{color:#3c3c43;margin:6px 0}}
+.card{{background:#fff;border-radius:12px;padding:14px 16px;margin:10px 0}}
+code,.val{{font:15px ui-monospace,Menlo,monospace;word-break:break-all}}
+button{{font:17px -apple-system,system-ui;background:#007aff;color:#fff;border:0;border-radius:10px;padding:10px 16px;margin-top:8px;width:100%}}
+ol{{padding-left:22px;margin:6px 0}} li{{margin:8px 0}} .muted{{color:#8e8e93;font-size:14px}}
+@media (prefers-color-scheme:dark){{body{{background:#000;color:#fff}} .card{{background:#1c1c1e}} p{{color:#ebebf5}}}}
+</style></head><body>
+<h1>Clipboard with Arch</h1>
+<p>Two Shortcuts, then copy on one device and tap the back of your iPhone.</p>
+<div class="card"><div class="muted">Address</div><div class="val" id="u">{e(base_url)}/clipboard</div><button onclick="cp('u')">Copy Address</button></div>
+<div class="card"><div class="muted">Header value for “Authorization”</div><div class="val" id="t">Bearer {e(token)}</div><button onclick="cp('t')">Copy Header</button></div>
+<h2>1. “Send to Arch”</h2><div class="card"><ol>
+<li>Shortcuts → <b>+</b> → name it <b>Send to Arch</b>.</li>
+<li>Add <b>Get Clipboard</b>.</li>
+<li>Add <b>Get Contents of URL</b>. URL: the address above. Show More → Method <b>POST</b>; Headers: add <b>Authorization</b> = the header above; Request Body <b>File</b> → <b>Clipboard</b>.</li>
+<li>Optional: add <b>Show Notification</b> “Sent to Arch”.</li></ol></div>
+<h2>2. “Get from Arch”</h2><div class="card"><ol>
+<li>New Shortcut <b>Get from Arch</b>.</li>
+<li>Add <b>Get Contents of URL</b> with the same address and Authorization header (Method <b>GET</b>).</li>
+<li>Add <b>Copy to Clipboard</b> (Contents of URL).</li>
+<li>Optional: <b>Show Notification</b> “Copied from Arch”.</li></ol></div>
+<h2>3. Back Tap</h2><div class="card"><p>Settings → Accessibility → Touch → <b>Back Tap</b>:</p><ol>
+<li><b>Double Tap</b> → Send to Arch</li><li><b>Triple Tap</b> → Get from Arch</li></ol>
+<p class="muted">Also turn on “Show in Share Sheet” for Send to Arch to send selected text or photos.</p></div>
+<p class="muted">Works on the same Wi-Fi. Anyone with this header can read your computer’s clipboard, so keep it to yourself; `abridge clip reset` makes a new one.</p>
+<script>function cp(id){{var r=document.createRange();r.selectNodeContents(document.getElementById(id));var s=getSelection();s.removeAllRanges();s.addRange(r);
+var v=document.getElementById(id).textContent;if(navigator.clipboard&&window.isSecureContext){{navigator.clipboard.writeText(v)}}else{{document.execCommand('copy')}}}}</script>
+</body></html>"""
+
+
+# ------------------------------------------------------------------- server
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "abridge-clipd"
+    cfg: dict
+    clipboard_env: dict | None = None  # tests pin an environment; normally read per request
+
+    @property
+    def clipboard(self) -> Clipboard:
+        return Clipboard(self.clipboard_env if self.clipboard_env is not None else desktop_env())
+
+    def log_message(self, fmt: str, *args) -> None:  # quieter than the default
+        sys.stderr.write("%s %s\n" % (self.client_address[0], fmt % args))
+
+    def _send(self, code: int, body: bytes = b"", ctype: str = "text/plain; charset=utf-8") -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if body and self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _guard(self, need_token: bool = True) -> bool:
+        if not client_allowed(self.client_address[0]):
+            self._send(403, b"only local-network clients are allowed\n")
+            return False
+        if not need_token:
+            return True
+        auth = self.headers.get("Authorization", "")
+        token = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("X-Abridge-Token", "").strip()
+        if not token or not secrets.compare_digest(token, self.cfg["token"]):
+            self._send(401, b"wrong or missing token; run `abridge clip pair` on the computer\n")
+            return False
+        return True
+
+    def do_GET(self) -> None:
+        url = urlparse(self.path)
+        if url.path == "/pair":
+            self._pair(parse_qs(url.query).get("code", [""])[0])
+            return
+        if not self._guard():
+            return
+        if url.path == "/ping":
+            self._send(200, b"ok\n")
+        elif url.path == "/clipboard":
+            problem = self.clipboard.available()
+            if problem:
+                self._send(503, (problem + "\n").encode())
+                return
+            got = self.clipboard.read()
+            if not got:
+                self._send(204)
+                return
+            data, mime = got
+            self._send(200, data, mime)
+        else:
+            self._send(404, b"not found\n")
+
+    def do_POST(self) -> None:
+        if not self._guard():
+            return
+        if urlparse(self.path).path != "/clipboard":
+            self._send(404, b"not found\n")
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0 or length > MAX_BODY:
+            self._send(413 if length > MAX_BODY else 400, b"send the clipboard as the request body\n")
+            return
+        data = self.rfile.read(length)
+        mime = (self.headers.get("Content-Type") or "text/plain").split(";")[0].strip().lower()
+        problem = self.clipboard.available()
+        if problem:
+            self._send(503, (problem + "\n").encode())
+            return
+        try:
+            self.clipboard.write(data, mime)
+        except RuntimeError as err:
+            self._send(500, (str(err) + "\n").encode())
+            return
+        if mime.startswith("image/"):
+            notify("Image from iPhone", "Copied to the clipboard")
+        else:
+            notify("Copied from iPhone", data.decode(errors="replace"))
+        self._send(200, b"ok\n")
+
+    do_PUT = do_POST
+
+    def _pair(self, code: str) -> None:
+        if not self._guard(need_token=False):
+            return
+        try:
+            pair = json.loads(PAIR.read_text())
+        except (OSError, ValueError):
+            pair = {}
+        if not pair.get("code") or time.time() > pair.get("expires", 0) or not secrets.compare_digest(code, pair["code"]):
+            self._send(403, b"this pairing link has expired; run `abridge clip pair` again\n")
+            return
+        host = self.headers.get("Host") or f"{self.server.server_address[0]}:{self.cfg['port']}"
+        self._send(200, pair_page(f"http://{host}", self.cfg["token"]).encode(), "text/html; charset=utf-8")
+
+
+def serve(port: int | None = None, host: str = "0.0.0.0") -> None:
+    cfg = ensure_config()
+    handler = type("BoundHandler", (Handler,), {"cfg": cfg})
+    server = ThreadingHTTPServer((host, port or int(cfg["port"])), handler)
+    sys.stderr.write(f"abridge-clipd listening on {host}:{server.server_address[1]}\n")
+    problem = Clipboard(desktop_env()).available()
+    if problem:
+        sys.stderr.write(f"warning: {problem}\n")
+    server.serve_forever()
+
+
+def main(argv: list[str]) -> int:
+    cmd = argv[1] if len(argv) > 1 else "serve"
+    if cmd == "serve":
+        serve()
+    elif cmd == "init":
+        cfg = ensure_config(int(argv[2]) if len(argv) > 2 else None)
+        print(cfg["port"])
+    elif cmd == "pair":
+        cfg = ensure_config()
+        code = f"{secrets.randbelow(10**6):06d}"
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        old = os.umask(0o077)
+        try:
+            PAIR.write_text(json.dumps({"code": code, "expires": time.time() + 600}))
+        finally:
+            os.umask(old)
+        print(code, cfg["port"])
+    elif cmd == "reset":
+        cfg = load_config()
+        cfg["token"] = secrets.token_urlsafe(24)
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        old = os.umask(0o077)
+        try:
+            CONFIG.write_text(json.dumps(cfg))
+        finally:
+            os.umask(old)
+        print("new token written; set up the Shortcuts again with `abridge clip pair`")
+    else:
+        print("usage: abridge-clipd [serve|init [PORT]|pair|reset]", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

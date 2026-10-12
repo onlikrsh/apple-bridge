@@ -83,6 +83,11 @@ Phone
   abridge usb encrypt              turn on encrypted backups (asks for a password)
   abridge usb mount DIR|umount DIR browse the phone's media folder
 
+Clipboard
+  abridge clip pair                pair your iPhone (scan the QR code it shows)
+  abridge clip on|off|status       the clipboard service
+  abridge clip reset               new token (re-pair afterwards)
+
 Low level
   abridge icloud ARGS...           pyicloud's own CLI, with the persistent session
   abridge secret set|get           the app-specific password used for CalDAV
@@ -671,6 +676,69 @@ cmd_timer() {
   esac
 }
 
+# ---------------------------------------------------------------- clipboard
+
+CLIPD="$ABRIDGE_ROOT/libexec/abridge-clipd"
+
+clipd() { ABRIDGE_CONFIG_DIR="$ABRIDGE_CONFIG_DIR" python3 "$CLIPD" "$@"; }
+
+lan_ip() {
+  ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit }}'
+}
+
+clip_on() {
+  local unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  clipd init >/dev/null
+  # The service reaches the clipboard through the desktop's display.
+  systemctl --user import-environment WAYLAND_DISPLAY DISPLAY XAUTHORITY 2>/dev/null || true
+  mkdir -p "$unit_dir"
+  sed "s|@CLIPD@|$CLIPD|; s|@CONFIG@|$ABRIDGE_CONFIG_DIR|" "$ABRIDGE_ROOT/share/systemd/abridge-clip.service" >"$unit_dir/abridge-clip.service"
+  systemctl --user daemon-reload
+  systemctl --user enable abridge-clip.service >/dev/null 2>&1
+  systemctl --user restart abridge-clip.service
+  ok "clipboard service running (logs: journalctl --user -u abridge-clip)"
+  if [ -n "${WAYLAND_DISPLAY:-}" ] && ! have wl-copy; then warn "install wl-clipboard: sudo pacman -S wl-clipboard"; fi
+  if [ -z "${WAYLAND_DISPLAY:-}" ] && ! have xclip; then warn "install xclip: sudo pacman -S xclip"; fi
+}
+
+cmd_clip() {
+  case "${1:-status}" in
+    on) clip_on ;;
+    off) systemctl --user disable --now abridge-clip.service ;;
+    pair)
+      systemctl --user is-active --quiet abridge-clip.service 2>/dev/null || clip_on
+      local code port ip host url
+      read -r code port < <(clipd pair)
+      ip="$(lan_ip)"
+      [ -n "$ip" ] || die "no network connection found; connect to Wi-Fi first"
+      url="http://$ip:$port/pair?code=$code"
+      echo
+      echo "On your iPhone, on the same Wi-Fi, scan this with the Camera app"
+      echo "(or open the link in Safari). It works for 10 minutes."
+      echo
+      if have qrencode; then qrencode -t ansiutf8 -m 2 "$url"; else warn "install qrencode to get a QR code here: sudo pacman -S qrencode"; fi
+      echo "  $url"
+      echo
+      if systemctl is-active --quiet avahi-daemon 2>/dev/null; then
+        host="$(uname -n).local"
+        echo "Tip: in the Shortcuts you can use http://$host:$port instead of the IP address,"
+        echo "     so they keep working when your router hands out a new IP."
+      else
+        echo "Tip: give this computer a fixed IP in your router (DHCP reservation), or"
+        echo "     run avahi-daemon so the Shortcuts can use $(uname -n).local."
+      fi
+      if systemctl is-active --quiet ufw 2>/dev/null; then echo "Your firewall (ufw) needs: sudo ufw allow from 192.168.0.0/16 to any port $port proto tcp"; fi
+      if systemctl is-active --quiet firewalld 2>/dev/null; then echo "Your firewall (firewalld) needs: sudo firewall-cmd --permanent --add-port=$port/tcp && sudo firewall-cmd --reload"; fi
+      ;;
+    reset)
+      clipd reset
+      systemctl --user restart abridge-clip.service 2>/dev/null || true
+      ;;
+    status) systemctl --user status abridge-clip.service --no-pager 2>&1 | head -n 5 ;;
+    *) die "usage: abridge clip pair|on|off|status|reset" ;;
+  esac
+}
+
 # ------------------------------------------------------------------ doctor
 
 cmd_doctor() {
@@ -724,6 +792,9 @@ cmd_doctor() {
   airdrop_check
   if [ -x "$AIRDROP_DIR/airdrop.sh" ]; then ok "installed"; else warn "not installed (abridge airdrop install)"; fi
 
+  step "Clipboard"
+  if systemctl --user is-active --quiet abridge-clip.service 2>/dev/null; then ok "clipboard service running"; else warn "off (abridge clip pair)"; fi
+
   step "Background sync"
   if systemctl --user is-enabled --quiet abridge-sync.timer 2>/dev/null; then ok "timer on"; else warn "timer off (abridge timer on)"; fi
 }
@@ -756,6 +827,7 @@ main() {
     icloud) cmd_icloud "$@" ;;
     secret) cmd_secret "$@" ;;
     timer) cmd_timer "$@" ;;
+    clip|clipboard) cmd_clip "$@" ;;
     doctor) cmd_doctor ;;
     help|-h|--help) usage ;;
     *) usage >&2; exit 2 ;;

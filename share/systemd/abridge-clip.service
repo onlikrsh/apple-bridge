@@ -1,0 +1,13 @@
+[Unit]
+Description=apple-bridge: clipboard bridge for your iPhone
+After=graphical-session.target
+
+[Service]
+# @CLIPD@ and @CONFIG@ are filled in by `abridge clip on`.
+Environment=ABRIDGE_CONFIG_DIR=@CONFIG@
+ExecStart=/usr/bin/env python3 @CLIPD@ serve
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
