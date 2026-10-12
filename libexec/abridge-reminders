@@ -15,7 +15,9 @@ bin/abridge runs this with the apple-bridge venv's python, which has pyicloud.
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -25,6 +27,7 @@ PRIORITIES = {"none": 0, "high": 1, "medium": 5, "low": 9}
 MIRROR_MARKER = ".abridge-mirror"
 REMINDER_PREFIX = "Reminder/"
 LIST_PREFIX = "List/"
+FULL_ID = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
 
 
 class UserError(Exception):
@@ -221,8 +224,6 @@ def list_color(raw: str | None) -> str | None:
     if raw.startswith("#") and len(raw) in (7, 9):
         return raw
     if raw.startswith("{"):
-        import json
-
         try:
             value = json.loads(raw).get("daHexString")
         except (ValueError, AttributeError):
@@ -329,6 +330,51 @@ def all_reminders(svc: Any, include_completed: bool) -> list[Any]:
     return [r for l in live_lists(svc) for r in reminders_in(svc, l, include_completed)]
 
 
+class Finder:
+    """Resolve ids to reminders. A full id (what the GUI sends) is one lookup;
+    a short id needs every reminder, which is fetched once and reused."""
+
+    def __init__(self, svc: Any) -> None:
+        self.svc = svc
+        self._pool: list[Any] | None = None
+
+    def __call__(self, query: str) -> Any:
+        q = bare_id(query.strip())
+        if FULL_ID.fullmatch(q):
+            try:
+                return self.svc.get(f"{REMINDER_PREFIX}{q}")
+            except LookupError:
+                pass
+        if self._pool is None:
+            self._pool = all_reminders(self.svc, include_completed=True)
+        return resolve_reminder(self._pool, query)
+
+
+def iso(moment: datetime | None) -> str | None:
+    return aware(moment).isoformat() if moment else None
+
+
+def reminder_json(r: Any) -> dict[str, Any]:
+    """The shape the Reminders app reads. Ids are bare (no 'Reminder/')."""
+    return {
+        "id": bare_id(r.id),
+        "short": short_id(r.id),
+        "list_id": bare_id(r.list_id or ""),
+        "title": r.title or "",
+        "notes": r.desc or "",
+        "completed": bool(r.completed),
+        "completed_date": iso(r.completed_date),
+        "due": iso(r.due_date),
+        "all_day": bool(r.all_day),
+        "due_label": due_label(r),
+        "priority": r.priority or 0,
+        "flagged": bool(r.flagged),
+        "parent_id": bare_id(r.parent_reminder_id) if r.parent_reminder_id else None,
+        "created": iso(r.created),
+        "modified": iso(r.modified),
+    }
+
+
 # ---------------------------------------------------------------- commands
 
 
@@ -405,20 +451,57 @@ def cmd_add(svc: Any, args: argparse.Namespace) -> None:
 
 
 def set_completed(svc: Any, args: argparse.Namespace, completed: bool) -> None:
-    pool = all_reminders(svc, include_completed=True)
+    find = Finder(svc)
     for query in args.ids:
-        r = resolve_reminder(pool, query)
+        r = find(query)
         r.completed = completed
         svc.update(r)
         print(f"{'done' if completed else 'not done'}: {r.title}  ({short_id(r.id)})")
 
 
 def cmd_rm(svc: Any, args: argparse.Namespace) -> None:
-    pool = all_reminders(svc, include_completed=True)
+    find = Finder(svc)
     for query in args.ids:
-        r = resolve_reminder(pool, query)
+        r = find(query)
         svc.delete(r)
         print(f"deleted: {r.title}  ({short_id(r.id)})")
+
+
+def cmd_edit(svc: Any, args: argparse.Namespace) -> None:
+    r = Finder(svc)(args.id)
+    if args.title is not None:
+        if not args.title.strip():
+            raise UserError("the title cannot be empty")
+        r.title = args.title
+    if args.notes is not None:
+        r.desc = args.notes
+    if args.no_due:
+        r.due_date, r.all_day, r.time_zone = None, False, None
+    elif args.due:
+        r.due_date, r.all_day, r.time_zone = parse_due(args.due)
+    if args.priority:
+        r.priority = PRIORITIES[args.priority]
+    if args.flag is not None:
+        r.flagged = args.flag
+    svc.update(r)
+    print(f"updated: {r.title}  ({short_id(r.id)})")
+
+
+def cmd_dump(svc: Any, args: argparse.Namespace) -> None:
+    out: dict[str, Any] = {"lists": [], "reminders": []}
+    for l in live_lists(svc):
+        rows = reminders_in(svc, l, args.completed)
+        out["lists"].append(
+            {
+                "id": bare_id(l.id),
+                "title": l.title,
+                "color": list_color(l.color),
+                "open": sum(1 for r in rows if not r.completed),
+            }
+        )
+        out["reminders"].extend(reminder_json(r) for r in rows)
+    json.dump(out, sys.stdout, ensure_ascii=False)
+    print()
 
 
 def cmd_mirror(svc: Any, args: argparse.Namespace) -> None:
@@ -464,6 +547,21 @@ def build_parser() -> argparse.ArgumentParser:
     rm = sub.add_parser("rm", help="delete reminders (they go to Recently Deleted)")
     rm.add_argument("ids", nargs="+", metavar="ID")
     rm.set_defaults(func=cmd_rm)
+
+    edit = sub.add_parser("edit", help="change a reminder")
+    edit.add_argument("id", metavar="ID")
+    edit.add_argument("-t", "--title")
+    edit.add_argument("-n", "--notes")
+    due = edit.add_mutually_exclusive_group()
+    due.add_argument("-d", "--due", help='YYYY-MM-DD, "YYYY-MM-DD HH:MM", today, tomorrow')
+    due.add_argument("--no-due", action="store_true", help="remove the due date")
+    edit.add_argument("-p", "--priority", choices=list(PRIORITIES))
+    edit.add_argument("-f", "--flag", action=argparse.BooleanOptionalAction, default=None)
+    edit.set_defaults(func=cmd_edit)
+
+    dump = sub.add_parser("dump", help="every list and reminder as JSON (for the app)")
+    dump.add_argument("--completed", action="store_true", help="include completed reminders")
+    dump.set_defaults(func=cmd_dump)
 
     mir = sub.add_parser("mirror", help="write every reminder to a vdir of .ics files")
     mir.add_argument("dest", nargs="?", default=os.environ.get("REMINDERS_DIR"))

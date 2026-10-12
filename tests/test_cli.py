@@ -186,6 +186,42 @@ def test_rem_done_undo_rm_by_short_id(ab):
     assert ab.state()["calls"][-1] == {"delete": "99887766-0000"}
 
 
+def test_rem_dump_is_what_the_app_reads(ab):
+    data = json.loads(ab.run("rem", "dump").stdout)
+    assert [l["title"] for l in data["lists"]] == ["Shopping", "Work"]
+    assert data["lists"][0] == {
+        "id": "AAAA0000-1111-2222-3333-444455556666", "title": "Shopping", "color": "#1BADF8", "open": 1,
+    }
+    titles = {r["title"]: r for r in data["reminders"]}
+    assert set(titles) == {"Milk", "Send report"}  # completed left out
+    report = titles["Send report"]
+    assert (report["due_label"], report["all_day"], report["priority"]) == ("2026-10-20", True, 1)
+    assert report["list_id"] == "BBBB0000-1111-2222-3333-444455556666"
+    full = json.loads(ab.run("rem", "dump", "--completed").stdout)
+    assert {r["title"] for r in full["reminders"]} == {"Milk", "Bread", "Send report"}
+
+
+def test_rem_edit_changes_only_what_was_asked(ab):
+    ab.run("rem", "edit", "ab12", "--title", "Oat milk", "--due", "2026-11-01 08:15", "--flag")
+    updated = ab.state()["updated"]
+    assert (updated["title"], updated["flagged"], updated["all_day"]) == ("Oat milk", True, False)
+    assert updated["due_date"] == "2026-11-01T08:15:00+00:00"
+    ab.run("rem", "edit", "99887766", "--no-due", "--no-flag", "-p", "low")
+    updated = ab.state()["updated"]
+    assert (updated["due_date"], updated["flagged"], updated["priority"]) == (None, False, 9)
+    proc = ab.run("rem", "edit", "ab12", "--title", "  ", ok=False)
+    assert proc.returncode == 1 and "cannot be empty" in proc.stderr
+
+
+def test_rem_full_uuid_is_looked_up_directly(ab):
+    state = ab.state()
+    full = "Reminder/0E9A1F2B-1234-5678-9ABC-DEF012345678"
+    state["reminders"].append({"id": full, "list_id": LIST_SHOP, "title": "Eggs"})
+    Path(ab.env["FAKE_ICLOUD_STATE"]).write_text(json.dumps(state))
+    ab.run("rem", "done", "0E9A1F2B-1234-5678-9ABC-DEF012345678")
+    assert ab.state()["calls"][-1] == {"update": "0E9A1F2B-1234-5678-9ABC-DEF012345678", "completed": True}
+
+
 def test_rem_unknown_list_and_ambiguous_id_are_clear_errors(ab):
     proc = ab.run("rem", "ls", "groceries", ok=False)
     assert proc.returncode == 1 and 'no list matches "groceries"' in proc.stderr

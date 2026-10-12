@@ -56,6 +56,12 @@ class _Reminders:
             rows = [r for r in rows if not r.completed]
         return SimpleNamespace(reminders=rows)
 
+    def get(self, reminder_id):
+        for raw in _load()["reminders"]:
+            if raw["id"] == reminder_id:
+                return _reminder(raw)
+        raise LookupError(reminder_id)
+
     def create(self, **kw):
         state = _load()
         kw = {k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in kw.items()}
@@ -68,6 +74,7 @@ class _Reminders:
     def update(self, reminder):
         state = _load()
         state["calls"].append({"update": bare(reminder.id), "completed": reminder.completed})
+        state["updated"] = _dump(reminder)
         state["reminders"] = [_dump(reminder) if r["id"] == reminder.id else r for r in state["reminders"]]
         _save(state)
 
