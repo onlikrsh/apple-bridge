@@ -25,7 +25,6 @@ const CONF = APPS[NAME];
 
 app.setName(`abridge-${NAME}`);
 app.setPath('userData', path.join(app.getPath('appData'), `apple-bridge-${NAME}`));
-if (process.env.ABRIDGE_APP_THEME) nativeTheme.themeSource = process.env.ABRIDGE_APP_THEME;
 protocol.registerSchemesAsPrivileged([{ scheme: 'vault', privileges: { standard: true, secure: true, supportFetchAPI: true } }]);
 
 let win = null;
@@ -156,6 +155,8 @@ function showContextMenu(p) {
 // -------------------------------------------------------------------- start
 
 function start() {
+  // Normally the system theme (GTK / the desktop portal) decides; tests force one.
+  if (process.env.ABRIDGE_APP_THEME) nativeTheme.themeSource = process.env.ABRIDGE_APP_THEME;
   try {
     paths = abridge.readPaths();
   } catch (err) {
@@ -220,8 +221,8 @@ function setupNotes() {
 
   ipcMain.handle('notes:scan', () => ({ configured: vault.exists(), root: vault.root, ...vault.scan() }));
   ipcMain.handle('notes:read', (_e, id) => vault.read(id));
-  ipcMain.handle('notes:write', (_e, { id, markdown }) => {
-    const summary = vault.write(id, markdown);
+  ipcMain.handle('notes:write', (_e, { id, markdown, mtime }) => {
+    const summary = vault.write(id, markdown, mtime);
     changed();
     return summary;
   });

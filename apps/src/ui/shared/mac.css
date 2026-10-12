@@ -1,0 +1,717 @@
+/* The macOS look, shared by Notes, Calendar and Reminders.
+ *
+ * Built from macOS Sonoma's published metrics and colours (13 px body text,
+ * 52 px unified toolbars, 12 px traffic lights, 6 px control radii, system
+ * blue/red/orange/yellow), not from Apple's assets: the font falls back to
+ * Inter, which is designed to sit close to SF Pro, and the icons are Lucide. */
+
+:root {
+  --font: -apple-system, 'SF Pro Text', 'SF Pro', Inter, 'Inter Variable', 'Cantarell', system-ui, sans-serif;
+  --font-display: -apple-system, 'SF Pro Display', 'SF Pro', Inter, 'Inter Variable', system-ui, sans-serif;
+  --mono: 'SF Mono', Menlo, 'JetBrains Mono', 'DejaVu Sans Mono', monospace;
+
+  --window: #ffffff;
+  --content: #ffffff;
+  --sidebar: #e9e8e7;
+  --sidebar-border: rgba(0, 0, 0, 0.09);
+  --text: rgba(0, 0, 0, 0.88);
+  --text-2: rgba(0, 0, 0, 0.5);
+  --text-3: rgba(0, 0, 0, 0.26);
+  --separator: rgba(0, 0, 0, 0.1);
+  --hover: rgba(0, 0, 0, 0.05);
+  --pressed: rgba(0, 0, 0, 0.1);
+  --selected: rgba(0, 0, 0, 0.09);
+  --control: #ffffff;
+  --control-border: rgba(0, 0, 0, 0.14);
+  --field: rgba(0, 0, 0, 0.05);
+  --popover: #f6f6f6;
+  --menu: rgba(238, 238, 238, 0.98);
+  --shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.18), 0 10px 32px rgba(0, 0, 0, 0.18), 0 2px 6px rgba(0, 0, 0, 0.08);
+  --icon: rgba(0, 0, 0, 0.55);
+
+  --blue: #007aff;
+  --red: #ff3b30;
+  --orange: #ff9500;
+  --yellow: #ffcc00;
+  --green: #34c759;
+  --gray: #8e8e93;
+  --accent: var(--blue);
+  --accent-text: #ffffff;
+
+  --tl-close: #ff5f57;
+  --tl-close-b: #e2463f;
+  --tl-min: #febc2e;
+  --tl-min-b: #e1a116;
+  --tl-max: #28c840;
+  --tl-max-b: #1aab29;
+  --tl-idle: #dddcdb;
+  --tl-idle-b: #cfcecd;
+
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --window: #1e1e1e;
+    --content: #1e1e1e;
+    --sidebar: #2b2a29;
+    --sidebar-border: rgba(0, 0, 0, 0.5);
+    --text: rgba(255, 255, 255, 0.88);
+    --text-2: rgba(255, 255, 255, 0.55);
+    --text-3: rgba(255, 255, 255, 0.25);
+    --separator: rgba(255, 255, 255, 0.1);
+    --hover: rgba(255, 255, 255, 0.06);
+    --pressed: rgba(255, 255, 255, 0.12);
+    --selected: rgba(255, 255, 255, 0.1);
+    --control: #3a3a3c;
+    --control-border: rgba(255, 255, 255, 0.12);
+    --field: rgba(255, 255, 255, 0.08);
+    --popover: #2c2c2e;
+    --menu: rgba(44, 44, 46, 0.98);
+    --shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.08) inset, 0 12px 36px rgba(0, 0, 0, 0.5);
+    --icon: rgba(255, 255, 255, 0.6);
+    --blue: #0a84ff;
+    --red: #ff453a;
+    --orange: #ff9f0a;
+    --yellow: #ffd60a;
+    --green: #30d158;
+    --gray: #98989d;
+    --tl-idle: #4b4a49;
+    --tl-idle-b: #3f3e3d;
+    color-scheme: dark;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  font: 13px/1.38 var(--font);
+  color: var(--text);
+  background: var(--window);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  cursor: default;
+  letter-spacing: -0.003em;
+}
+
+input,
+textarea,
+select,
+button {
+  font: inherit;
+  color: inherit;
+  letter-spacing: inherit;
+}
+
+button {
+  cursor: default;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+/* ------------------------------------------------------------- scrollbars */
+
+::-webkit-scrollbar {
+  width: 11px;
+  height: 11px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.22);
+  border-radius: 6px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(0, 0, 0, 0.4);
+}
+@media (prefers-color-scheme: dark) {
+  ::-webkit-scrollbar-thumb {
+    background-color: rgba(255, 255, 255, 0.22);
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: rgba(255, 255, 255, 0.4);
+  }
+}
+
+/* ---------------------------------------------------------------- layout */
+
+.app {
+  display: flex;
+  height: 100vh;
+}
+
+.sidebar {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  background: var(--sidebar);
+  border-right: 1px solid var(--sidebar-border);
+  min-width: 0;
+}
+
+.sidebar-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 10px 10px;
+}
+
+.sidebar-footer {
+  flex: none;
+  padding: 8px 12px 10px;
+}
+
+.toolbar {
+  flex: none;
+  height: 52px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 10px;
+  -webkit-app-region: drag;
+}
+
+.toolbar > *,
+.toolbar button,
+.toolbar input {
+  -webkit-app-region: no-drag;
+}
+
+.toolbar .spacer {
+  flex: 1;
+  -webkit-app-region: drag;
+}
+
+.toolbar-title {
+  font: 600 15px/1.2 var(--font-display);
+  -webkit-app-region: drag;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.toolbar-subtitle {
+  font-size: 11px;
+  color: var(--text-2);
+  -webkit-app-region: drag;
+}
+
+/* -------------------------------------------------------- traffic lights */
+
+.traffic {
+  display: flex;
+  gap: 8px;
+  padding: 0 10px 0 10px;
+  height: 52px;
+  align-items: center;
+  flex: none;
+  -webkit-app-region: no-drag;
+}
+
+.traffic button {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 0.5px solid;
+  padding: 0;
+  display: grid;
+  place-items: center;
+}
+
+.traffic svg {
+  width: 8px;
+  height: 8px;
+  opacity: 0;
+  stroke: rgba(0, 0, 0, 0.6);
+  stroke-width: 1.4;
+  fill: none;
+}
+
+.traffic .close { background: var(--tl-close); border-color: var(--tl-close-b); }
+.traffic .min { background: var(--tl-min); border-color: var(--tl-min-b); }
+.traffic .max { background: var(--tl-max); border-color: var(--tl-max-b); }
+.traffic:hover svg { opacity: 1; }
+.traffic button:active { filter: brightness(0.85); }
+
+body.inactive .traffic:not(:hover) button {
+  background: var(--tl-idle);
+  border-color: var(--tl-idle-b);
+}
+
+/* ---------------------------------------------------------------- icons */
+
+.icon {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  stroke-width: 1.7;
+}
+
+.tool {
+  height: 28px;
+  min-width: 32px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--icon);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+}
+
+.tool .icon {
+  width: 18px;
+  height: 18px;
+  stroke-width: 1.6;
+}
+
+.tool:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+.tool:active:not(:disabled),
+.tool.on {
+  background: var(--pressed);
+}
+
+.tool:disabled {
+  opacity: 0.35;
+}
+
+.tool-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-2);
+}
+
+/* --------------------------------------------------------------- controls */
+
+.search {
+  position: relative;
+  display: flex;
+  align-items: center;
+  height: 28px;
+  border-radius: 7px;
+  background: var(--field);
+  padding: 0 8px 0 26px;
+  min-width: 150px;
+}
+
+.search .icon {
+  position: absolute;
+  left: 7px;
+  width: 14px;
+  height: 14px;
+  color: var(--text-2);
+  stroke-width: 2;
+}
+
+.search input {
+  border: 0;
+  outline: 0;
+  background: transparent;
+  width: 100%;
+  height: 100%;
+  font-size: 13px;
+}
+
+.search input::placeholder,
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-3);
+}
+
+.search:focus-within {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+.btn {
+  height: 24px;
+  padding: 0 12px;
+  border-radius: 6px;
+  border: 0.5px solid var(--control-border);
+  background: var(--control);
+  box-shadow: 0 0.5px 1px rgba(0, 0, 0, 0.12);
+  font-size: 13px;
+}
+
+.btn:active {
+  filter: brightness(0.94);
+}
+
+.btn.primary {
+  background: var(--accent);
+  border-color: transparent;
+  color: #fff;
+}
+
+.btn.destructive {
+  color: var(--red);
+}
+
+.btn:disabled {
+  opacity: 0.4;
+}
+
+.segmented {
+  display: inline-flex;
+  padding: 2px;
+  gap: 2px;
+  background: var(--field);
+  border-radius: 7px;
+}
+
+.segmented button {
+  height: 22px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.segmented button.on {
+  background: var(--control);
+  box-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.12), 0 1px 2px rgba(0, 0, 0, 0.12);
+}
+
+.field {
+  height: 24px;
+  border-radius: 5px;
+  border: 0.5px solid var(--control-border);
+  background: var(--control);
+  padding: 0 7px;
+  outline: none;
+  font-size: 13px;
+}
+
+.field:focus,
+select.field:focus {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+textarea.field {
+  height: auto;
+  padding: 5px 7px;
+  resize: none;
+}
+
+input[type='checkbox'].check {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 3.5px;
+  border: 0.5px solid var(--control-border);
+  background: var(--control);
+  display: inline-grid;
+  place-items: center;
+  margin: 0;
+  box-shadow: 0 0.5px 1px rgba(0, 0, 0, 0.12);
+}
+
+input[type='checkbox'].check:checked {
+  background: var(--check-color, var(--accent));
+  border-color: transparent;
+}
+
+input[type='checkbox'].check:checked::after {
+  content: '';
+  width: 8px;
+  height: 4px;
+  border: solid #fff;
+  border-width: 0 0 1.8px 1.8px;
+  transform: translateY(-1px) rotate(-45deg);
+}
+
+.switch {
+  appearance: none;
+  width: 26px;
+  height: 15px;
+  border-radius: 8px;
+  background: var(--pressed);
+  position: relative;
+  margin: 0;
+  transition: background 0.15s;
+}
+
+.switch::after {
+  content: '';
+  position: absolute;
+  top: 1px;
+  left: 1px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 0.5px 2px rgba(0, 0, 0, 0.3);
+  transition: transform 0.15s;
+}
+
+.switch:checked {
+  background: var(--switch-color, var(--accent));
+}
+
+.switch:checked::after {
+  transform: translateX(11px);
+}
+
+/* --------------------------------------------------------- sidebar rows */
+
+.section-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-2);
+  padding: 14px 8px 4px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 28px;
+  padding: 0 8px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+
+.row .name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.row .count {
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+}
+
+.row.selected {
+  background: var(--selected);
+}
+
+/* --------------------------------------------------------------- popover */
+
+.popover {
+  position: fixed;
+  z-index: 50;
+  background: var(--popover);
+  border-radius: 11px;
+  box-shadow: var(--shadow);
+  padding: 14px;
+  animation: pop-in 0.12s ease-out;
+}
+
+.popover .arrow {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  background: var(--popover);
+  transform: rotate(45deg);
+  box-shadow: -0.5px -0.5px 0 rgba(0, 0, 0, 0.12);
+}
+
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+}
+
+.menu {
+  position: fixed;
+  z-index: 60;
+  min-width: 180px;
+  padding: 5px;
+  border-radius: 9px;
+  background: var(--menu);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(20px);
+  animation: pop-in 0.08s ease-out;
+}
+
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 22px;
+  padding: 0 10px 0 8px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+
+.menu-item .check-mark {
+  width: 12px;
+  font-size: 12px;
+  text-align: center;
+}
+
+.menu-item .shortcut {
+  margin-left: auto;
+  padding-left: 18px;
+  color: var(--text-2);
+}
+
+.menu-item:hover:not(.disabled) {
+  background: var(--accent);
+  color: #fff;
+}
+
+.menu-item:hover:not(.disabled) .shortcut {
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.menu-item.disabled {
+  color: var(--text-3);
+}
+
+.menu-sep {
+  height: 1px;
+  margin: 5px 9px;
+  background: var(--separator);
+}
+
+/* ---------------------------------------------------------------- alerts */
+
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  background: rgba(0, 0, 0, 0.12);
+  display: grid;
+  place-items: center;
+}
+
+.alert {
+  width: 260px;
+  padding: 20px 16px 16px;
+  border-radius: 12px;
+  background: var(--popover);
+  box-shadow: var(--shadow);
+  text-align: center;
+  animation: pop-in 0.12s ease-out;
+}
+
+.alert .alert-icon {
+  width: 56px;
+  height: 56px;
+  margin: 0 auto 10px;
+}
+
+.alert h3 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.alert p {
+  margin: 0 0 16px;
+  font-size: 11px;
+  color: var(--text-2);
+}
+
+.alert .alert-buttons {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.alert .alert-buttons .btn {
+  height: 28px;
+  width: 100%;
+}
+
+/* ----------------------------------------------------------------- toast */
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  z-index: 80;
+  transform: translateX(-50%);
+  max-width: 70vw;
+  padding: 8px 14px;
+  border-radius: 10px;
+  background: var(--menu);
+  box-shadow: var(--shadow);
+  font-size: 12px;
+  animation: pop-in 0.15s ease-out;
+}
+
+.toast.error {
+  color: var(--red);
+}
+
+/* ------------------------------------------------------------ sync badge */
+
+.sync {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--text-2);
+  padding: 0 6px;
+  height: 24px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+
+.sync .icon {
+  width: 13px;
+  height: 13px;
+}
+
+.sync.syncing .icon {
+  animation: spin 1s linear infinite;
+}
+
+.sync.error {
+  color: var(--red);
+}
+
+.sync:hover {
+  background: var(--hover);
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ----------------------------------------------------------- empty state */
+
+.empty {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  text-align: center;
+  color: var(--text-3);
+  font-size: 15px;
+  padding: 40px;
+}
+
+.empty code {
+  font: 12px var(--mono);
+  color: var(--text-2);
+  background: var(--field);
+  padding: 2px 6px;
+  border-radius: 4px;
+  user-select: text;
+}

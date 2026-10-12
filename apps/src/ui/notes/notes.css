@@ -1,0 +1,536 @@
+/* Notes: macOS Sonoma's three-column Notes window. */
+
+:root {
+  --accent: #e5a800;
+  --note-accent: #e5a800;
+  --note-select: #fde49b;
+  --note-select-blur: rgba(0, 0, 0, 0.08);
+  --folder: #e5a800;
+  --check: #e8a700;
+  --mono-bg: rgba(0, 0, 0, 0.04);
+  --table-line: rgba(0, 0, 0, 0.14);
+  --banner: #fff6d6;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --accent: #ffd60a;
+    --note-accent: #ffd60a;
+    --note-select: rgba(255, 204, 0, 0.34);
+    --note-select-blur: rgba(255, 255, 255, 0.1);
+    --folder: #ffd60a;
+    --check: #ffd60a;
+    --mono-bg: rgba(255, 255, 255, 0.06);
+    --table-line: rgba(255, 255, 255, 0.16);
+    --banner: rgba(255, 214, 10, 0.12);
+  }
+}
+
+.folders {
+  width: 210px;
+}
+
+.folders .toolbar {
+  padding-left: 0;
+}
+
+.folder .folder-icon {
+  color: var(--folder);
+  width: 17px;
+  height: 17px;
+  stroke-width: 1.7;
+}
+
+.folder.drop {
+  background: color-mix(in srgb, var(--note-accent) 35%, transparent);
+}
+
+.folder-input {
+  flex: 1;
+  height: 22px;
+}
+
+.new-folder {
+  border: 0;
+  background: transparent;
+  color: var(--text-2);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 2px;
+  border-radius: 6px;
+}
+
+.new-folder .icon {
+  width: 17px;
+  height: 17px;
+}
+
+.new-folder:hover {
+  color: var(--text);
+}
+
+/* ------------------------------------------------------------------ list */
+
+.list-col {
+  width: 290px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--separator);
+  background: var(--content);
+  min-width: 0;
+}
+
+.list-heading {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding-left: 6px;
+  -webkit-app-region: drag;
+}
+
+.list-col .toolbar-title {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.note-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 10px 12px;
+  outline: none;
+}
+
+.list-section {
+  font-size: 12px;
+  font-weight: 700;
+  padding: 12px 10px 6px;
+  color: var(--text);
+}
+
+.note-row {
+  padding: 8px 12px 9px;
+  border-radius: 8px;
+  position: relative;
+}
+
+.note-row + .note-row::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 12px;
+  right: 12px;
+  height: 1px;
+  background: var(--separator);
+}
+
+.note-row.selected::before,
+.note-row.selected + .note-row::before {
+  display: none;
+}
+
+.note-row.selected {
+  background: var(--note-select-blur);
+}
+
+.note-list.focused .note-row.selected {
+  background: var(--note-select);
+}
+
+.note-title {
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.note-title .clip {
+  width: 12px;
+  height: 12px;
+  color: var(--text-2);
+}
+
+.note-meta {
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.note-when {
+  flex: none;
+  color: var(--text);
+}
+
+.note-snippet {
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.note-folder {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-2);
+  margin-top: 1px;
+}
+
+.note-folder .icon {
+  width: 12px;
+  height: 12px;
+}
+
+.list-empty {
+  color: var(--text-3);
+  text-align: center;
+  padding-top: 40%;
+  font-size: 15px;
+}
+
+/* ---------------------------------------------------------------- editor */
+
+.editor-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--content);
+}
+
+.toolbar-gap {
+  width: 10px;
+}
+
+.editor-col .search {
+  width: 170px;
+  margin-left: 4px;
+}
+
+.banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 16px 6px;
+  padding: 7px 12px;
+  border-radius: 8px;
+  background: var(--banner);
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.banner .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.editor-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 0 40vh;
+}
+
+.note-date-line {
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-2);
+  padding: 4px 0 10px;
+}
+
+.editor-host {
+  padding: 0 44px;
+}
+
+.note-body {
+  outline: none;
+  font-size: 14px;
+  line-height: 1.45;
+  caret-color: var(--note-accent);
+  user-select: text;
+  cursor: text;
+  min-height: 60vh;
+}
+
+.note-body ::selection {
+  background: color-mix(in srgb, var(--note-accent) 38%, transparent);
+}
+
+.note-body > * + * {
+  margin-top: 0;
+}
+
+.note-body p {
+  margin: 0;
+  min-height: 1.45em;
+}
+
+.note-body h1,
+.note-body h2,
+.note-body h3 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 700;
+  letter-spacing: -0.012em;
+}
+
+.note-body h1 {
+  font-size: 25px;
+  line-height: 1.3;
+  margin-bottom: 4px;
+}
+
+.note-body h2 {
+  font-size: 19px;
+  line-height: 1.35;
+  margin-top: 6px;
+}
+
+.note-body h3 {
+  font-size: 15px;
+  line-height: 1.4;
+  margin-top: 4px;
+}
+
+.note-body a {
+  color: var(--note-accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.note-body pre.mono,
+.note-body pre {
+  font: 13px/1.5 var(--mono);
+  background: var(--mono-bg);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 4px 0;
+  white-space: pre-wrap;
+}
+
+.note-body code {
+  font: 13px var(--mono);
+}
+
+.note-body blockquote {
+  margin: 2px 0;
+  padding-left: 12px;
+  border-left: 3px solid var(--text-3);
+  color: var(--text-2);
+}
+
+.note-body ul,
+.note-body ol {
+  margin: 0;
+  padding-left: 26px;
+}
+
+.note-body li > p {
+  min-height: 0;
+}
+
+/* Checklists: round, filled with the Notes accent when done. */
+.note-body ul[data-type='taskList'] {
+  list-style: none;
+  padding-left: 2px;
+}
+
+.note-body ul[data-type='taskList'] > li {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin: 3px 0;
+}
+
+.note-body ul[data-type='taskList'] > li > label {
+  flex: none;
+  margin-top: 1px;
+  user-select: none;
+}
+
+.note-body ul[data-type='taskList'] > li > div {
+  flex: 1;
+}
+
+.note-body ul[data-type='taskList'] > li input[type='checkbox'] {
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  border-radius: 50%;
+  border: 1.4px solid var(--text-3);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
+
+.note-body ul[data-type='taskList'] > li input[type='checkbox']:checked {
+  background: var(--check);
+  border-color: var(--check);
+}
+
+.note-body ul[data-type='taskList'] > li input[type='checkbox']:checked::after {
+  content: '';
+  width: 8px;
+  height: 4px;
+  border: solid #fff;
+  border-width: 0 0 2px 2px;
+  transform: translateY(-1px) rotate(-45deg);
+}
+
+.note-body ul[data-type='taskList'] > li[data-checked='true'] > div {
+  color: var(--text-2);
+}
+
+/* Tables: a light grid, every cell alike, as Notes draws them. */
+.note-body table {
+  border-collapse: collapse;
+  margin: 8px 0;
+  table-layout: fixed;
+  min-width: 50%;
+}
+
+.note-body th,
+.note-body td {
+  border: 1px solid var(--table-line);
+  padding: 5px 8px;
+  vertical-align: top;
+  text-align: left;
+  font-weight: inherit;
+  min-width: 80px;
+}
+
+.note-body th p,
+.note-body td p {
+  min-height: 1.3em;
+}
+
+.note-body .selectedCell {
+  background: color-mix(in srgb, var(--note-accent) 18%, transparent);
+}
+
+.note-body img {
+  max-width: 100%;
+  border-radius: 6px;
+  margin: 6px 0;
+}
+
+.note-body .is-empty::before,
+.note-body h1.is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  color: var(--text-3);
+  pointer-events: none;
+  float: left;
+  height: 0;
+}
+
+/* --------------------------------------------------------------- format */
+
+.format {
+  margin: -6px -4px;
+}
+
+.fmt-row {
+  display: flex;
+  gap: 4px;
+  padding-bottom: 8px;
+}
+
+.fmt-btn {
+  flex: 1;
+  height: 26px;
+  border-radius: 6px;
+  border: 0.5px solid var(--control-border);
+  background: var(--control);
+  font-size: 14px;
+}
+
+.fmt-btn.on {
+  background: var(--note-accent);
+  border-color: transparent;
+  color: #000;
+}
+
+.fmt-style {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 6px;
+  border-radius: 5px;
+}
+
+.fmt-style:hover {
+  background: var(--hover);
+}
+
+.fmt-style .check-mark {
+  width: 12px;
+  color: var(--note-accent);
+  font-weight: 700;
+}
+
+.fmt-style.title .fmt-label {
+  font-size: 19px;
+  font-weight: 700;
+}
+
+.fmt-style.heading .fmt-label {
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.fmt-style.subheading .fmt-label {
+  font-weight: 700;
+}
+
+.fmt-style.monostyled .fmt-label {
+  font-family: var(--mono);
+}
+
+.link-pop {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pop-label {
+  font-weight: 600;
+}
+
+.pop-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.empty-title {
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--text-2);
+  margin-bottom: 8px;
+}
+
+.empty p {
+  font-size: 13px;
+  color: var(--text-2);
+}
+
+/* ------------------------------------------------------- collapsed sidebar */
+
+body.no-sidebar .folders {
+  display: none;
+}
+
+.list-col .only-collapsed {
+  display: none;
+}
+
+body.no-sidebar .list-col .only-collapsed {
+  display: flex;
+}

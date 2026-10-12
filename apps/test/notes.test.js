@@ -88,6 +88,18 @@ test('filename vaults: the title line becomes the name, a retitle is an apple-no
   assert.equal(fs.readFileSync(path.join(root, 'Ideas.md'), 'utf8'), 'first\n');
 });
 
+test('a write refuses to clobber a file a pull changed since it was loaded', () => {
+  const { root, v } = vault();
+  fs.writeFileSync(path.join(root, 'A.md'), '# A\n');
+  const loaded = v.read('A.md');
+  fs.writeFileSync(path.join(root, 'A.md'), '# A\nfrom the phone\n');
+  fs.utimesSync(path.join(root, 'A.md'), new Date(), new Date(Date.now() + 5000));
+  assert.throws(() => v.write('A.md', '# A\nmine\n', loaded.mtime), (e) => e.code === 'CHANGED_ON_DISK');
+  assert.equal(fs.readFileSync(path.join(root, 'A.md'), 'utf8'), '# A\nfrom the phone\n');
+  const fresh = v.read('A.md');
+  assert.equal(v.write('A.md', '# A\nmine\n', fresh.mtime).title, 'A');
+});
+
 test('paths outside the vault are refused', () => {
   const { v } = vault();
   assert.throws(() => v.read('../etc/passwd.md'), /outside/);

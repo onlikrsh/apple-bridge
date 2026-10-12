@@ -194,6 +194,7 @@ class NotesVault {
     const rel = this.rel(full);
     return {
       id: rel,
+      search: `${title}\n${body}`.slice(0, 20000).toLowerCase(),
       folder: path.posix.dirname(rel) === '.' ? '' : path.posix.dirname(rel),
       noteId: frontmatterValue(frontmatter, 'apple-note-id') || null,
       title,
@@ -215,8 +216,16 @@ class NotesVault {
    * as its first line, which is split off here: the body goes to the file and
    * a changed title becomes an `apple-note-title` request.
    */
-  write(id, markdown) {
+  write(id, markdown, expectedMtime) {
     const full = this.abs(id);
+    // A pull (from the app or the background timer) may have rewritten the
+    // file since the editor loaded it. Writing over it would quietly revert
+    // what came from the phone, so refuse and let the app reload instead.
+    if (expectedMtime && Math.abs(fs.statSync(full).mtimeMs - expectedMtime) > 1) {
+      const err = new Error('This note changed on another device. It has been reloaded.');
+      err.code = 'CHANGED_ON_DISK';
+      throw err;
+    }
     const filenameMode = this.titleMode() === 'filename';
     const current = fs.readFileSync(full, 'utf8');
     let { frontmatter } = splitFrontmatter(current, filenameMode);
