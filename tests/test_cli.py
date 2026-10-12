@@ -358,6 +358,24 @@ def test_airdrop_needs_install_first(ab):
     assert proc.returncode == 1 and "abridge airdrop install" in proc.stderr
 
 
+def test_airdrop_send_runs_once_per_file_with_the_receiver(ab, tmp_path):
+    log = ab.home / "airdrop.log"
+    write_exe(
+        ab.data / "src/airdrop-mt7921/airdrop.sh",
+        f'#!/bin/sh\necho "$1 $(basename "$2") ACTIVE=$ACTIVE RECEIVER=${{RECEIVER:-}}" >> "{log}"\n',
+    )
+    a, b = tmp_path / "a.jpg", tmp_path / "b.pdf"
+    a.write_text("a")
+    b.write_text("b")
+    ab.run("airdrop", "send", "--to", "Harsh's iPhone", str(a), str(b))
+    assert log.read_text().splitlines() == [
+        "send a.jpg ACTIVE=1 RECEIVER=Harsh's iPhone",
+        "send b.pdf ACTIVE=1 RECEIVER=Harsh's iPhone",
+    ]
+    proc = ab.run("airdrop", "send", str(tmp_path / "missing.jpg"), ok=False)
+    assert proc.returncode == 1 and "not a file" in proc.stderr
+
+
 def test_usb_without_a_phone(ab):
     proc = ab.run("usb", "info", ok=False)
     assert proc.returncode == 1

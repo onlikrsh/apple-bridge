@@ -150,6 +150,7 @@ render_vdirsyncer_config() {
   check_plain CALENDAR_DIR "$CALENDAR_DIR"
   check_plain CONTACTS_DIR "$CONTACTS_DIR"
   check_plain ABRIDGE_ROOT "$ABRIDGE_ROOT"
+  check_plain ABRIDGE_STATE_DIR "$ABRIDGE_STATE_DIR"
   cat <<EOF
 # Written by \`abridge setup calendar\`; re-running it overwrites this file.
 [general]
@@ -486,7 +487,11 @@ EOF
         files+=("$(readlink -f "$f")")
       done
       echo "Phone: unlocked, share sheet CLOSED, AirDrop on Everyone for 10 Minutes." >&2
-      (cd "$AIRDROP_DIR" && RECEIVER="$receiver" ACTIVE=1 ./airdrop.sh send "${files[@]}")
+      [ -n "$receiver" ] && export RECEIVER="$receiver"
+      # airdrop.sh sends a single file per run, so send them one at a time.
+      for f in "${files[@]}"; do
+        (cd "$AIRDROP_DIR" && ACTIVE=1 ./airdrop.sh send "$f") || die "sending $f failed"
+      done
       ;;
     *) die "usage: abridge airdrop check|install|receive|send [--to NAME] FILE..." ;;
   esac
