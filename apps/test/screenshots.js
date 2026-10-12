@@ -23,6 +23,14 @@ async function launch(app, theme, fixture) {
     env: { ...process.env, HOME: home, ABRIDGE_BIN: path.join(fixture, 'bin', 'abridge'), ABRIDGE_APP_NO_SYNC: '1', ABRIDGE_APP_THEME: theme, DBUS_SESSION_BUS_ADDRESS: 'disabled:' },
   });
   const page = await electronApp.firstWindow();
+  // A window that isn't in front gets no frames, and a screenshot waits for one.
+  await electronApp.evaluate(({ BrowserWindow }) => {
+    const w = BrowserWindow.getAllWindows()[0];
+    w.webContents.setBackgroundThrottling(false);
+    w.show();
+    w.focus();
+    w.moveTop();
+  });
   page.on('pageerror', (e) => console.error(`[${app}] page error:`, e.message));
   page.on('console', (m) => m.type() === 'error' && console.error(`[${app}] console:`, m.text()));
   await page.setViewportSize({ width: 1180, height: 740 });

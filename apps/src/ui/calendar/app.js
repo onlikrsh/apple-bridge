@@ -33,6 +33,8 @@ const fmt = {
   monthLong: new Intl.DateTimeFormat(undefined, { month: 'long' }),
   monthShort: new Intl.DateTimeFormat(undefined, { month: 'short' }),
   dayMonth: new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short' }),
+  dayMonthLong: new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'long' }),
+  dayMonthYear: new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'long', year: 'numeric' }),
   full: new Intl.DateTimeFormat(undefined, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }),
 };
 const timeLabel = (d) => fmt.time.format(d).replace(':00', '');
@@ -87,6 +89,8 @@ function layout() {
     els.body,
   );
   root.append(els.sidebar, els.main);
+  // Window or sidebar resized: the month's cells hold a different number of events.
+  new ResizeObserver(() => state.view === 'month' && fitMonth()).observe(els.body);
   if (localStorage.getItem('cal-sidebar') === 'hidden') document.body.classList.add('no-sidebar');
 }
 
@@ -218,7 +222,13 @@ function renderTitle() {
   const d = state.date;
   clear(els.title);
   if (state.view === 'year') els.title.append(h('b', {}, d.getFullYear()));
-  else if (state.view === 'day') els.title.append(h('b', {}, `${d.getDate()} ${fmt.monthLong.format(d)}`), ` ${d.getFullYear()}`, h('div', { class: 'cal-subtitle' }, fmt.weekdayLong.format(d)));
+  else if (state.view === 'day') {
+    // In the locale's order: "October 12, 2026", "12 October 2026", ...
+    const dayMonth = fmt.dayMonthLong.format(d);
+    const full = fmt.dayMonthYear.format(d);
+    const rest = full.startsWith(dayMonth) ? full.slice(dayMonth.length) : ` ${d.getFullYear()}`;
+    els.title.append(h('b', {}, dayMonth), rest, h('div', { class: 'cal-subtitle' }, fmt.weekdayLong.format(d)));
+  }
   else els.title.append(h('b', {}, fmt.monthLong.format(d)), ` ${d.getFullYear()}`);
 }
 
@@ -302,12 +312,15 @@ function renderTimeGrid() {
     const cols = layoutColumns(dayEvents);
     for (const pe of dayEvents) {
       const { col: c, cols: n } = cols.get(pe);
+      const height = Math.max(((pe._e - pe._s) / 60) * HOUR - 2, 18);
       const el = eventEl(Object.getPrototypeOf(pe), 'block', {
         top: `${(pe._s / 60) * HOUR}px`,
-        height: `${Math.max(((pe._e - pe._s) / 60) * HOUR - 2, 18)}px`,
+        height: `${height}px`,
         left: `calc(${(c / n) * 100}% + 1px)`,
         width: `calc(${100 / n}% - 3px)`,
       });
+      // Too short for two lines: title and time side by side, like macOS.
+      if (height < 34) el.classList.add('compact');
       col.append(el);
     }
     if (sameDay(d, today)) {
@@ -323,16 +336,34 @@ function renderTimeGrid() {
   });
   scroller.append(grid);
   els.body.append(head, allDay, scroller);
-  // Re-rendering after an edit keeps the scroll position; navigating to
-  // another day or week starts near now (or 8 AM).
+  // Re-rendering after an edit keeps the scroll position. Otherwise a day or
+  // week opens at its first event (or 8 AM), moved down only as far as it
+  // takes to keep now in sight.
   const gridKey = `${state.view}:${ymd(days[0])}`;
-  const now = new Date();
-  const focusHour = days.some((d) => sameDay(d, now)) ? Math.max(0, now.getHours() - 2) : 8;
-  const top = state.gridKey === gridKey && state.gridScroll !== undefined ? state.gridScroll : focusHour * HOUR;
+  const top = state.gridKey === gridKey && state.gridScroll !== undefined ? state.gridScroll : openingScroll(days, events, scroller.clientHeight);
   state.gridKey = gridKey;
   scroller.scrollTop = top;
   requestAnimationFrame(() => (scroller.scrollTop = top));
   scroller.addEventListener('scroll', () => (state.gridScroll = scroller.scrollTop));
+}
+
+/** Where a day or week opens: half an hour before its first timed event
+ * (8 AM without one), but never so high that now drops out of view. */
+function openingScroll(days, events, height) {
+  let first = 8 * 60;
+  for (const ev of events) {
+    const { start, end } = span(ev);
+    if (ev.allDay || end - start >= DAY) continue;
+    for (const d of days) if (sameDay(start, d)) first = Math.min(first, start.getHours() * 60 + start.getMinutes());
+  }
+  const visible = ((height || 480) / HOUR) * 60; // minutes in view
+  let top = Math.max(0, first - 30);
+  const now = new Date();
+  if (days.some((d) => sameDay(d, now))) {
+    const mins = now.getHours() * 60 + now.getMinutes();
+    if (mins > top + visible - 20) top = mins - visible + 20;
+  }
+  return (Math.max(0, top) / 60) * HOUR;
 }
 
 /** Drag on empty grid space to make an event; double-click makes a one-hour one. */
@@ -409,11 +440,9 @@ function renderMonth() {
         return !ev.allDay && end - start < DAY && onDay(ev, d) && sameDay(start, d);
       });
       const hiddenBars = bars.filter((b) => laneOf.get(b) >= 3 && b.from <= i && b.to >= i).length;
-      const room = Math.max(0, 4 - shownLanes);
-      const list = h('div', { class: 'month-events' });
-      timed.slice(0, room).forEach((ev) => list.append(eventEl(ev, 'line')));
-      const more = timed.length - Math.min(timed.length, room) + hiddenBars;
-      if (more > 0) list.append(h('div', { class: 'more', onclick: () => (goTo(d), setView('day')) }, `${more} more…`));
+      const list = h('div', { class: 'month-events', dataset: { hiddenBars } });
+      timed.forEach((ev) => list.append(eventEl(ev, 'line')));
+      list.append(h('div', { class: 'more', onclick: () => (goTo(d), setView('day')) }));
       cell.append(list);
       row.append(cell);
     });
@@ -425,6 +454,29 @@ function renderMonth() {
     grid.append(row);
   }
   els.body.append(head, grid);
+  fitMonth();
+}
+
+/** Each day shows as many events as its cell has room for, then "N more…".
+ * Run again whenever the cells change size. */
+function fitMonth() {
+  for (const list of els.body.querySelectorAll('.month-events')) {
+    const lines = [...list.querySelectorAll('.event.line')];
+    const more = list.querySelector('.more');
+    const hiddenBars = Number(list.dataset.hiddenBars);
+    let shown = lines.length;
+    const update = () => {
+      lines.forEach((l, i) => (l.style.display = i < shown ? '' : 'none'));
+      const n = lines.length - shown + hiddenBars;
+      more.style.display = n ? '' : 'none';
+      more.textContent = `${n} more…`;
+    };
+    update();
+    while (shown > 0 && list.scrollHeight > list.clientHeight + 1) {
+      shown -= 1;
+      update();
+    }
+  }
 }
 
 // ------------------------------------------------------------------- year
@@ -775,7 +827,8 @@ function openInspector(ev, anchor) {
 
   popover(anchor, body, {
     side: 'right',
-    width: 300,
+    width: 330,
+    top: els.main.querySelector('.toolbar').getBoundingClientRect().bottom,
     onClose: async () => {
       select(null);
       if (discard) return;

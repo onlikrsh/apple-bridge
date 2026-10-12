@@ -75,7 +75,7 @@ body.no-sidebar .only-collapsed {
 
 .cal-header {
   display: flex;
-  align-items: flex-end;
+  align-items: flex-start;
   padding: 2px 18px 10px;
   flex: none;
 }
@@ -104,7 +104,7 @@ body.no-sidebar .only-collapsed {
 .nav {
   display: flex;
   gap: 2px;
-  padding-bottom: 3px;
+  margin-top: 3px; /* level with the title's first line, also in Day view */
 }
 
 .nav-btn {
@@ -309,6 +309,30 @@ body.no-sidebar .only-collapsed {
   text-overflow: ellipsis;
 }
 
+/* Under two lines tall: "1:1 with Priya  3 PM" on one line, never a half-cut
+   second line. When both don't fit, the time wraps to a row far below the
+   block's edge, out of sight, and the title has the line to itself. */
+.event.block.compact {
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  column-gap: 5px;
+  row-gap: 40px;
+  white-space: nowrap;
+  padding-top: 1px;
+  padding-bottom: 0;
+}
+
+.event.block.compact .ev-title {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.event.block.compact .ev-time {
+  flex: none;
+}
+
 .event .resize {
   position: absolute;
   left: 0;
@@ -468,12 +492,31 @@ body.no-sidebar .only-collapsed {
 .month-events {
   display: flex;
   flex-direction: column;
-  gap: 1px;
+  gap: 0;
+  flex: 1;
   min-height: 0;
+  overflow: hidden;
+}
+
+/* Full height or not at all: fitMonth() hides what doesn't fit. */
+.month-events > * {
+  flex: none;
+}
+
+/* A narrow day keeps the titles and drops the times, like macOS. */
+.month-cell {
+  container-type: inline-size;
+}
+
+@container (max-width: 118px) {
+  .event.line .ev-time {
+    display: none;
+  }
 }
 
 .more {
   font-size: 11px;
+  line-height: 13px; /* an event and "1 more…" fit even the smallest cell */
   color: var(--text-2);
   padding: 0 6px;
 }
@@ -655,12 +698,15 @@ body.no-sidebar .only-collapsed {
   height: 24px;
 }
 
+/* The date takes what the time leaves: the row fits the popover. */
 .insp-control input[type='date'] {
-  width: 124px;
+  flex: 1;
+  min-width: 0;
 }
 
 .insp-control input[type='time'] {
-  width: 112px;
+  flex: none;
+  width: 110px;
 }
 
 .insp-control select {

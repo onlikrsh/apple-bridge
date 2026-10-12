@@ -129,7 +129,8 @@ document.addEventListener('keydown', (e) => {
   }
 }, true);
 
-function place(el, anchorRect, side, gap) {
+/** Position `el` beside `anchorRect`, inside the window and below `top`. */
+function place(el, anchorRect, side, gap, top = 8) {
   document.body.append(el);
   const r = el.getBoundingClientRect();
   const vw = window.innerWidth;
@@ -147,7 +148,7 @@ function place(el, anchorRect, side, gap) {
     if (y + r.height > vh - 8) y = anchorRect.top - r.height - gap;
   }
   x = Math.max(8, Math.min(x, vw - r.width - 8));
-  y = Math.max(8, Math.min(y, vh - r.height - 8));
+  y = Math.max(top, Math.min(y, vh - r.height - 8));
   el.style.left = `${x}px`;
   el.style.top = `${y}px`;
   return { x, y, w: r.width, h: r.height };
@@ -157,12 +158,12 @@ function place(el, anchorRect, side, gap) {
  * A popover with an arrow pointing at `anchor` (an element or a DOMRect).
  * Clicking outside or pressing Escape closes it and calls onClose.
  */
-export function popover(anchor, content, { side = 'right', onClose = () => {}, width } = {}) {
+export function popover(anchor, content, { side = 'right', onClose = () => {}, width, top = 8 } = {}) {
   closeOverlay();
   const rect = anchor instanceof Element ? anchor.getBoundingClientRect() : anchor;
   const arrow = h('div', { class: 'arrow' });
   const el = h('div', { class: 'popover', style: width ? { width: `${width}px` } : {} }, arrow, content);
-  const p = place(el, rect, side, 12);
+  const p = place(el, rect, side, 12, top);
   if (side === 'right' || side === 'left') {
     const ay = Math.max(14, Math.min(rect.top + rect.height / 2 - p.y - 7, p.h - 28));
     const leftOfAnchor = p.x + p.w <= rect.left + 1;

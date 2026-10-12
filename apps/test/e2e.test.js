@@ -189,6 +189,69 @@ test('notes: switching notes saves first; search finds body text', { skip }, asy
 
 const icsFiles = (dir) => fs.readdirSync(dir).filter((f) => f.endsWith('.ics'));
 
+test('calendar: the layout holds at the default and the smallest size', { skip }, async () => {
+  const s = await start('calendar');
+  try {
+    const { page } = s;
+    await page.setViewportSize({ width: 1240, height: 820 });
+    await page.waitForSelector('.tg-grid');
+    await page.locator('.segmented button', { hasText: 'Week' }).click();
+    await page.waitForTimeout(300);
+    const inView = (el, box) => el.y >= box.y - 1 && el.y + el.height <= box.y + box.height + 1;
+
+    // The week opens at its first event: the 7 AM gym, not mid-morning.
+    const scroller = await page.locator('.tg-scroll').boundingBox();
+    assert.ok(inView(await page.locator('.event.block', { hasText: 'Gym' }).first().boundingBox(), scroller), 'the first event is in view');
+
+    // A 30-minute event: title and time on one line, none of it cut off.
+    const short = page.locator('.event.block', { hasText: '1:1 with Priya' });
+    assert.match(await short.getAttribute('class'), /\bcompact\b/);
+    const [title, time] = await Promise.all([short.locator('.ev-title').boundingBox(), short.locator('.ev-time').boundingBox()]);
+    assert.ok(Math.abs(title.y - time.y) < 2, 'one line');
+    assert.ok(inView(time, await short.boundingBox()), 'the time is not clipped');
+
+    // The inspector's fields stay inside it, and it stays below the toolbar.
+    await page.locator('.event', { hasText: 'Design review' }).first().click();
+    const pop = await page.locator('.popover').boundingBox();
+    for (const input of await page.locator('.popover input[type=date], .popover input[type=time]').all()) {
+      const r = await input.boundingBox();
+      assert.ok(r.x + r.width <= pop.x + pop.width - 8, 'field inside the popover');
+    }
+    const toolbar = await page.locator('.cal-main .toolbar').boundingBox();
+    assert.ok(pop.y >= toolbar.y + toolbar.height - 1, 'popover below the toolbar');
+    await page.keyboard.press('Escape');
+
+    // Day view: the title in the locale's order, the buttons where they were.
+    const navBefore = await page.locator('.nav').boundingBox();
+    await page.locator('.segmented button', { hasText: 'Day' }).click();
+    await page.waitForTimeout(200);
+    const expected = await page.evaluate(() => new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'long', year: 'numeric' }).format(new Date()));
+    assert.equal((await page.locator('.cal-title').textContent()).replace(/\s+/g, ' ').trim().startsWith(expected), true);
+    assert.equal((await page.locator('.nav').boundingBox()).y, navBefore.y);
+
+    // Month at the smallest window: no day's events overlap or spill out.
+    await page.setViewportSize({ width: 780, height: 520 });
+    await page.locator('.segmented button', { hasText: 'Month' }).click();
+    await page.waitForTimeout(400);
+    let mores = 0;
+    for (const list of await page.locator('.month-events').all()) {
+      const box = await list.boundingBox();
+      const rows = [];
+      for (const child of await list.locator(':scope > *').all()) {
+        if (!(await child.isVisible())) continue;
+        const r = await child.boundingBox();
+        assert.ok(inView(r, box), 'inside its day');
+        for (const other of rows) assert.ok(r.y >= other.y + other.height - 0.5, 'no overlap');
+        rows.push(r);
+      }
+      if (await list.locator('.more').isVisible()) mores += 1;
+    }
+    assert.ok(mores > 0, 'busy days say how many more');
+  } finally {
+    await s.done();
+  }
+});
+
 test('calendar: double-click creates, the inspector edits, drag moves', { skip }, async () => {
   const s = await start('calendar');
   try {
