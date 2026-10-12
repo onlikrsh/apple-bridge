@@ -625,6 +625,81 @@ def test_setup_notes_refuses_a_non_empty_folder(ab):
 # ---------------------------------------------------------------------- sync
 
 
+@pytest.fixture
+def emptied(ab):
+    """A Home calendar with no events left on this computer, whose vdirsyncer
+    status still remembers one, and a vdirsyncer stub that refuses to sync it
+    the way the real one does until it's settled."""
+    import sqlite3
+
+    (ab.home / ".config/apple-bridge/vdirsyncer.conf").write_text("# stub\n")
+    home = ab.data / "calendars/home-id"
+    home.mkdir(parents=True)
+    (home / "displayname").write_text("Home")
+    status_dir = ab.home / ".local/state/apple-bridge/vdirsyncer/icloud_calendar"
+    status_dir.mkdir(parents=True)
+    db = sqlite3.connect(status_dir / "home-id.items")
+    db.execute("create table status (ident text, href_a text, href_b text)")
+    db.execute("insert into status values ('E1', 'E1.ics', '/1/calendars/home-id/E1.ics')")
+    db.commit()
+    db.close()
+    calls = ab.tmp / "vdirsyncer-calls"
+    side = ab.tmp / "emptied-side"
+    side.write_text("local")
+    write_exe(
+        ab.tmp / "stubs/vdirsyncer",
+        f"""#!/bin/sh
+echo "$*" >> "{calls}"
+case "$*" in
+  metasync) exit 0 ;;
+  *--force-delete*) rm -f "{status_dir}/home-id.items"; exit 0 ;;
+esac
+if [ -f "{status_dir}/home-id.items" ]; then
+  s=$(cat "{side}")
+  echo 'error: icloud_calendar/home-id: Storage "icloud_calendar_'"$s"'/home-id" was completely emptied. If you want to delete ALL entries on BOTH sides,then use ...' >&2
+  exit 1
+fi
+""",
+    )
+    return SimpleNamespace(home=home, calls=lambda: calls.read_text().splitlines(), side=side)
+
+
+def test_sync_lets_the_calendar_app_empty_a_calendar(ab, emptied):
+    (emptied.home / ".abridge-removed").write_text("E1.ics\n")
+    proc = ab.run("sync", "calendar")
+    assert "deleted its last events in the Calendar app" in proc.stderr
+    assert "sync --force-delete icloud_calendar/home-id" in emptied.calls()
+    assert emptied.calls()[-1] == "sync"  # and a normal sync after it
+    assert not (emptied.home / ".abridge-removed").exists()  # every removal reached iCloud
+
+
+def test_sync_keeps_a_calendar_emptied_any_other_way(ab, emptied):
+    (emptied.home / ".abridge-removed").write_text("Other.ics\n")  # not the missing event
+    proc = ab.run("sync", "calendar", ok=False)
+    assert proc.returncode == 1
+    assert "weren't deleted in the Calendar app, so iCloud keeps them" in proc.stderr
+    assert 'abridge sync calendar --restore "Home"' in proc.stderr
+    assert not any("force-delete" in c for c in emptied.calls())
+    assert (emptied.home / ".abridge-removed").exists()
+    # Emptied on the iPhone: the copies here are kept the same way.
+    emptied.side.write_text("remote")
+    proc = ab.run("sync", "calendar", ok=False)
+    assert "no events left in iCloud" in proc.stderr and "force-delete" not in " ".join(emptied.calls())
+
+
+def test_sync_calendar_settles_an_emptied_calendar_by_name(ab, emptied):
+    proc = ab.run("sync", "calendar", "--restore", "Home")
+    assert "Home is in sync again" in proc.stderr
+    assert emptied.calls()[-1] == "sync icloud_calendar/home-id"
+    assert not (ab.home / ".local/state/apple-bridge/vdirsyncer/icloud_calendar/home-id.items").exists()
+    ab.run("sync", "calendar", "--delete-emptied", "home-id")
+    assert emptied.calls()[-1] == "sync --force-delete icloud_calendar/home-id"
+    proc = ab.run("sync", "calendar", "--restore", "Holidays", ok=False)
+    assert proc.returncode == 1 and 'no calendar named "Holidays"' in proc.stderr
+    assert ab.run("sync", "notes", "--restore", "x", ok=False).returncode == 1
+
+
+
 def test_sync_with_nothing_set_up_says_where_to_start(ab):
     proc = ab.run("sync")
     assert "abridge setup calendar" in proc.stderr

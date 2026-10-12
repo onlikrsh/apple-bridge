@@ -220,6 +220,11 @@ and your Wi-Fi stays connected.
 
 - **First step is always `abridge doctor`.**
 - **Background sync logs**: `journalctl --user -u abridge-sync -e`
+- **"Home has no events left on this computer"** (or "in iCloud"): every
+  event of that calendar is gone from one side, and not by the Calendar app,
+  so vdirsyncer won't copy the emptiness over. `abridge sync calendar
+  --delete-emptied Home` deletes them on the other side too; `--restore Home`
+  brings them back.
 - **vdirsyncer says 401 Unauthorized**: the app-specific password was revoked
   or mistyped. Run `abridge secret set`.
 - **Reminders: "not signed in"**: the ~2-month session expired. Run

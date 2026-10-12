@@ -97,10 +97,15 @@ test('create, edit and delete round-trip through real .ics files', () => {
   assert.deepEqual([lunch.title, lunch.end, lunch.location, lunch.alarm], ['Long lunch', '2026-10-16T09:00:00.000Z', '', null]);
   assert.match(fs.readFileSync(path.join(home, made.file), 'utf8'), /SEQUENCE:2/);
 
+  // Each file taken out of a calendar is noted, so `abridge sync` can tell
+  // emptying a calendar here from a wiped folder.
+  const removed = (dir) => fs.readFileSync(path.join(home, '..', dir, '.abridge-removed'), 'utf8');
   s.save({ ...lunch, toCalendarId: 'work' });
   assert.equal(s.events(...OCT)[0].calendarId, 'work');
+  assert.equal(removed('home-uuid'), `${made.file}\n`);
   s.remove({ calendarId: 'work', file: made.file });
   assert.equal(s.events(...OCT).length, 0);
+  assert.equal(removed('work'), `${made.file}\n`);
 });
 
 test('editing one occurrence moves the series; deleting one occurrence adds an EXDATE', () => {
@@ -117,6 +122,7 @@ test('editing one occurrence moves the series; deleting one occurrence adds an E
   const third = s.events(...OCT)[2];
   s.remove({ calendarId: third.calendarId, file: third.file, scope: 'one', recurrenceId: third.recurrenceId });
   assert.deepEqual(s.events(...OCT).map((e) => e.start.slice(5, 10)), ['10-05', '10-12', '10-26']);
+  assert.equal(fs.existsSync(path.join(home, '.abridge-removed')), false, 'the series file is still there');
 });
 
 test('all-day create and bad ids', () => {

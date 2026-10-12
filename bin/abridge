@@ -67,6 +67,9 @@ Pairing
 Everyday
   abridge sync [calendar|reminders|notes]
                                    sync everything that is set up, or one part
+  abridge sync calendar --delete-emptied|--restore CALENDAR
+                                   a calendar left with no events on one side:
+                                   delete them on the other too, or bring them back
   abridge cal [khal args]          calendar (default: next 7 days)
   abridge contacts [khard args]    contacts (default: list)
   abridge rem lists                reminder lists
@@ -606,11 +609,92 @@ cmd_usb() {
 
 # -------------------------------------------------------------------- sync
 
-_calendar_sync() { vdirsyncer_run metasync && vdirsyncer_run sync; }
+# vdirsyncer won't sync a calendar whose every event is gone from one side
+# ("was completely emptied"), so a wiped folder can't wipe iCloud. The
+# Calendar app lists each event it removes in the calendar folder's
+# .abridge-removed (apps/src/main/calendar.js), so deleting the last event
+# there still syncs; any other emptying is reported with both ways out.
+CALENDAR_REMOVED=".abridge-removed"
+
+# Whether the Calendar app removed every event vdirsyncer last saw in local
+# calendar $1.
+calendar_emptied_here() {
+  python3 - "$ABRIDGE_STATE_DIR/vdirsyncer/icloud_calendar/$1.items" "$CALENDAR_DIR/$1/$CALENDAR_REMOVED" <<'EOF'
+import sqlite3, sys
+try:
+    db = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+    known = {row[0] for row in db.execute("select href_a from status")}
+    removed = set(open(sys.argv[2], encoding="utf-8").read().split())
+except (OSError, sqlite3.Error):
+    sys.exit(1)
+sys.exit(0 if known and known <= removed else 1)
+EOF
+}
+
+calendar_name() { cat "$CALENDAR_DIR/$1/displayname" 2>/dev/null || printf '%s' "$1"; }
+
+_calendar_sync() {
+  vdirsyncer_run metasync || return 1
+  local log side coll name status=0 forced=0
+  log="$(mktemp)"
+  vdirsyncer_run sync 2>"$log" || status=$?
+  cat "$log" >&2
+  if [ "$status" != 0 ]; then
+    while read -r side coll; do
+      name="$(calendar_name "$coll")"
+      if [ "$side" = local ] && calendar_emptied_here "$coll"; then
+        ok "$name: you deleted its last events in the Calendar app; deleting them in iCloud too"
+        vdirsyncer_run sync --force-delete "icloud_calendar/$coll" && forced=1
+      elif [ "$side" = local ]; then
+        warn "$name has no events left on this computer, but they weren't deleted in the Calendar app, so iCloud keeps them."
+        warn "To delete them in iCloud too: abridge sync calendar --delete-emptied \"$name\". To get them back here: abridge sync calendar --restore \"$name\""
+      else
+        warn "$name has no events left in iCloud (deleted on the iPhone?), so the copies here are kept."
+        warn "To delete them here too: abridge sync calendar --delete-emptied \"$name\". To put them back in iCloud: abridge sync calendar --restore \"$name\""
+      fi
+    done < <(sed -n 's|^error: icloud_calendar/\([^:]*\): Storage "icloud_calendar_\([a-z]*\)/[^"]*" was completely emptied.*|\2 \1|p' "$log")
+    if [ "$forced" = 1 ]; then
+      status=0
+      vdirsyncer_run sync || status=$?
+    fi
+  fi
+  rm -f "$log"
+  # Every removal has reached iCloud.
+  [ "$status" = 0 ] && rm -f "$CALENDAR_DIR"/*/"$CALENDAR_REMOVED"
+  return "$status"
+}
+
+# `abridge sync calendar --delete-emptied|--restore NAME`: settle a calendar
+# that vdirsyncer won't sync because one side has no events left.
+calendar_settle() {
+  local how="$1" want="$2" dir coll=""
+  for dir in "$CALENDAR_DIR"/*/; do
+    [ -d "$dir" ] || continue
+    dir="${dir%/}"
+    if [ "${dir##*/}" = "$want" ] || [ "$(calendar_name "${dir##*/}")" = "$want" ]; then coll="${dir##*/}"; break; fi
+  done
+  [ -n "$coll" ] || die "no calendar named \"$want\". Try: abridge cal printcalendars"
+  case "$how" in
+    --delete-emptied) vdirsyncer_run sync --force-delete "icloud_calendar/$coll" ;;
+    # Forget what was synced: the side that still has the events copies
+    # them to the other again.
+    --restore) rm -f "$ABRIDGE_STATE_DIR/vdirsyncer/icloud_calendar/$coll.items" && vdirsyncer_run sync "icloud_calendar/$coll" ;;
+  esac && ok "$(calendar_name "$coll") is in sync again"
+}
 
 cmd_sync() {
   local only="${1:-}" failed=0 any=0
   case "$only" in ""|calendar|contacts|reminders|notes) ;; *) die "usage: abridge sync [calendar|reminders|notes]" ;; esac
+  case "${2:-}" in
+    "") ;;
+    --delete-emptied|--restore)
+      [ "$only" = calendar ] && [ -n "${3:-}" ] || die "usage: abridge sync calendar $2 CALENDAR"
+      [ -f "$VDIRSYNCER_CONF" ] || die "calendar is not set up yet. Run: abridge setup calendar"
+      with_lock calendar calendar_settle "$2" "$3"
+      return
+      ;;
+    *) die "usage: abridge sync [calendar|reminders|notes]" ;;
+  esac
   if [ -f "$VDIRSYNCER_CONF" ] && { [ -z "$only" ] || [ "$only" = calendar ] || [ "$only" = contacts ]; }; then
     any=1
     step "Calendar and contacts"

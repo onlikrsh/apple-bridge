@@ -23,6 +23,15 @@ means the iPhone's copy wins when both sides changed the same item.
 The calendar storage is limited to `item_types = ["VEVENT"]` because of
 Reminders (next section).
 
+vdirsyncer won't sync a calendar whose every event is gone from one side
+("was completely emptied"), so a wiped folder can't wipe iCloud. That also
+stopped the last event of a calendar from ever being deleted. The Calendar
+app now lists each event it removes in the calendar folder's
+`.abridge-removed`, and `abridge sync` lets the deletion through when every
+event vdirsyncer last saw there is on that list (`--force-delete` for that
+calendar only). Any other emptying is reported by name with both ways out:
+`abridge sync calendar --delete-emptied NAME` or `--restore NAME`.
+
 ## Reminders: CloudKit, not CalDAV
 
 Until iOS 13, reminders were VTODOs on the same CalDAV server. The "upgraded"
@@ -252,7 +261,8 @@ keeps their syncs from overlapping.
 - **Calendar** reads and writes vdirsyncer's `.ics` files with ical.js,
   then runs `abridge sync calendar`. Edits keep every property they don't
   show (attendees, Apple's `X-` properties), keep an event's time zone when
-  moving it, and bump `SEQUENCE`.
+  moving it, and bump `SEQUENCE`. Removing or moving an event out of a
+  calendar is noted in `.abridge-removed` (see Calendar and Contacts above).
 - **Reminders** calls `abridge rem dump/add/edit/done/rm`, one at a time.
 
 ## The clipboard bridge

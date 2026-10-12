@@ -18,6 +18,7 @@ const HIDDEN = /^Reminders\b.*⚠/; // the stub CalDAV list left behind by the R
 // skipping them is cheap, the cap only stops a runaway rule.
 const MAX_OCCURRENCES = 100000;
 const PRODID = '-//apple-bridge//Calendar//EN';
+const REMOVED = '.abridge-removed'; // per calendar folder; vdirsyncer and this store only read *.ics
 
 function normColor(raw) {
   const m = /^#?([0-9a-f]{6})/i.exec(String(raw || '').trim());
@@ -210,6 +211,7 @@ class CalendarStore {
       const target = path.join(this.dir(ev.toCalendarId), ev.file);
       fs.renameSync(full, target);
       this.cache.delete(full);
+      this.noteRemoved(ev.calendarId, ev.file);
       full = target;
       ev = { ...ev, calendarId: ev.toCalendarId };
     }
@@ -261,12 +263,27 @@ class CalendarStore {
     return { calendarId: ev.calendarId, file, uid };
   }
 
+  /**
+   * Note that this app took `file` out of a calendar. vdirsyncer won't sync a
+   * calendar whose every event is gone ("completely emptied"), so a wiped
+   * folder can't empty iCloud; `abridge sync` lets it through when each
+   * missing event is listed here (bin/abridge: calendar_emptied_here).
+   */
+  noteRemoved(calendarId, file) {
+    try {
+      fs.appendFileSync(path.join(this.dir(calendarId), REMOVED), `${file}\n`);
+    } catch {
+      // Only the last event of a calendar needs it, and sync says so then.
+    }
+  }
+
   /** scope 'one' adds an EXDATE (or drops the exception); 'all' deletes the file. */
   remove({ calendarId, file, scope = 'all', recurrenceId = null }) {
     const full = this.file(calendarId, file);
     if (scope === 'all' || !recurrenceId) {
       fs.unlinkSync(full);
       this.cache.delete(full);
+      this.noteRemoved(calendarId, file);
       return;
     }
     const vcal = this.load(full);
