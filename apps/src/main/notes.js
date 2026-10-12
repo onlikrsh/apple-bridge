@@ -213,8 +213,9 @@ class NotesVault {
 
   /**
    * Save the editor's Markdown. In a filename vault the editor shows the title
-   * as its first line, which is split off here: the body goes to the file and
-   * a changed title becomes an `apple-note-title` request.
+   * as its first line, which is split off here: the lines after it are the
+   * body exactly (empty first paragraphs included), and a changed title
+   * becomes an `apple-note-title` request.
    */
   write(id, markdown, expectedMtime) {
     const full = this.abs(id);
@@ -235,7 +236,7 @@ class NotesVault {
       const title = plainText(first);
       const known = frontmatterValue(frontmatter, 'apple-note-title') || path.basename(full, '.md');
       if (title && title !== known) frontmatter = setFrontmatterValue(frontmatter, 'apple-note-title', title);
-      body = rest.join('\n').replace(/^\n/, '');
+      body = rest.join('\n'); // the editor sends the title line, then the body as is
     }
     writeAtomic(full, frontmatter + body);
     return this.summary(full, filenameMode);
@@ -249,7 +250,7 @@ class NotesVault {
     const [first, ...rest] = markdown.split('\n');
     const name = uniqueName(dir, `${safeName(plainText(first))}.md`);
     const full = path.join(dir, name);
-    writeAtomic(full, filenameMode ? rest.join('\n').replace(/^\n/, '') : markdown);
+    writeAtomic(full, filenameMode ? rest.join('\n') : markdown);
     return this.summary(full, filenameMode);
   }
 

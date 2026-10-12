@@ -3,7 +3,8 @@
 import '../shared/mac.css';
 import './notes.css';
 import { h, clear, icon, tool, trafficLights, initWindow, popover, menu, closeOverlay, toast, syncBadge, resizable } from '../shared/ui.js';
-import { createEditor, noteMarkdown } from './editor.js';
+import { createEditor, createReader, noteMarkdown, setNote } from './editor.js';
+import { mergeEdit } from './merge.js';
 
 const ALL = '*';
 const state = {
@@ -16,6 +17,7 @@ const state = {
 };
 
 let editor;
+let readBack;
 let saveTimer = null;
 const els = {};
 
@@ -343,9 +345,10 @@ async function openNote(id) {
   }
   state.selected = id;
   state.current = { id, folder: note.folder, mtime: note.mtime, readOnly: note.readOnly, dirty: false, titleMode: note.titleMode };
-  const md = note.titleMode === 'filename' ? `# ${note.title}\n\n${note.body}` : note.body;
+  const md = note.titleMode === 'filename' ? `# ${note.title}\n${note.body}` : note.body;
+  state.current.original = md; // the file as it is, which a save edits rather than replaces
   editor.setEditable(!note.readOnly);
-  editor.commands.setContent(note.readOnly ? withVaultImages(md, id) : md, false);
+  setNote(editor, note.readOnly ? withVaultImages(md, id) : md);
   // What saving this note unchanged would write. Loading can fire update
   // events (the editor normalises the document); only a real difference
   // from this baseline is ever saved.
@@ -402,10 +405,17 @@ function save() {
   saveTimer = null;
   const cur = state.current;
   if (!cur || !cur.dirty) return saving;
-  const markdown = noteMarkdown(editor);
+  const edited = noteMarkdown(editor);
   cur.dirty = false;
-  if (markdown === cur.baseline) return saving;
-  cur.baseline = markdown;
+  if (edited === cur.baseline) return saving;
+  // Write only what changed (merge.js): the editor's own Markdown would also
+  // rewrite blank lines, table padding and spaces the user never touched.
+  // If the merged text wouldn't read back as the editor shows it, write the
+  // editor's Markdown as before.
+  const merged = mergeEdit(cur.original, cur.baseline, edited);
+  const markdown = merged === edited || readBack(merged) === edited ? merged : edited;
+  cur.baseline = edited;
+  cur.original = markdown;
   saving = saving.then(async () => {
     try {
       let summary;
@@ -588,6 +598,7 @@ async function boot() {
   layout();
   initWindow();
   editor = createEditor(els.editorHost, { onUpdate: scheduleSave });
+  readBack = createReader();
   window.__abridge = { editor, state }; // for the end-to-end tests
   document.addEventListener('keydown', globalKeys);
   window.api.notes.onChanged(async () => {

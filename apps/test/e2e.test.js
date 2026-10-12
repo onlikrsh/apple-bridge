@@ -13,10 +13,11 @@ const { execFileSync } = require('node:child_process');
 const ROOT = path.resolve(__dirname, '..');
 const skip = !process.env.DISPLAY && 'no X display';
 
-async function start(app) {
+async function start(app, prepare = () => {}) {
   const { _electron } = require('playwright-core');
   const fixture = fs.mkdtempSync(path.join(os.homedir(), '.abe2e-'));
   execFileSync(process.execPath, [path.join(__dirname, 'make-fixture.js'), fixture]);
+  prepare(fixture);
   const home = path.join(fixture, 'home');
   fs.mkdirSync(home);
   const electronApp = await _electron.launch({
@@ -84,7 +85,9 @@ test('notes: checklist ticks, new notes, folders and delete', { skip }, async ()
     await page.keyboard.type('Tag the build');
     await page.waitForTimeout(1200);
     const made = path.join(s.notes, 'Work/Release checklist.md');
-    assert.equal(read(made), '# Release checklist\n\nTag the build\n');
+    // One line per paragraph, as icloud-md reads it: a blank line here would
+    // be an empty paragraph on the iPhone.
+    assert.equal(read(made), '# Release checklist\nTag the build\n');
     assert.match(await page.locator('.row.folder.selected').textContent(), /Work\s*3/);
 
     // Delete it again.
@@ -99,6 +102,61 @@ test('notes: checklist ticks, new notes, folders and delete', { skip }, async ()
     await page.locator('.note-row', { hasText: 'Standup notes' }).dispatchEvent('mousedown');
     await page.waitForTimeout(400);
     assert.deepEqual(fs.readdirSync(path.join(s.notes, 'Work')).sort(), ['Interview questions.md', 'Standup notes.md']);
+  } finally {
+    await s.done();
+  }
+});
+
+test('notes: a tick rewrites only its own line', { skip }, async () => {
+  // icloud-md's rendering of a note from the iPhone: two empty paragraphs, a
+  // trailing space, a table with bare separators and an empty cell, and a
+  // checklist straight after it. The editor's own Markdown would collapse,
+  // pad and move all of that; pushed, it once froze Notes on the iPhone.
+  const original = '---\napple-note-id: "S1"\n---\n\n# Shop\n\n\nBring bags \n\n| Aisle | Item |\n| - | - |\n| 4 | |\n- [ ] Milk\n- [ ] Eggs\n';
+  const file = (fixture) => path.join(fixture, 'Notes/Notes/Shop.md');
+  const s = await start('notes', (fixture) => fs.writeFileSync(file(fixture), original));
+  try {
+    const { page } = s;
+    await page.locator('.note-row', { hasText: 'Shop' }).first().dispatchEvent('mousedown');
+    await page.waitForTimeout(400);
+    assert.equal(read(file(s.fixture)), original, 'opening it must not change it');
+    await page.locator('.note-body input[type=checkbox]').first().click();
+    await page.waitForTimeout(1200);
+    assert.equal(read(file(s.fixture)), original.replace('- [ ] Milk', '- [x] Milk'));
+    // Typing into the table's neighbour paragraph leaves the table alone too.
+    await page.locator('.note-body p', { hasText: 'Bring bags' }).click();
+    await page.keyboard.press('End');
+    await page.keyboard.type(' and a list');
+    await page.waitForTimeout(1200);
+    assert.equal(read(file(s.fixture)), original.replace('- [ ] Milk', '- [x] Milk').replace('Bring bags ', 'Bring bags and a list'));
+  } finally {
+    await s.done();
+  }
+});
+
+test('notes: one line per paragraph, as on the iPhone', { skip }, async () => {
+  // Plain lines one after another are separate paragraphs in Notes; read as
+  // CommonMark they would merge into one, and the line after a list into
+  // its last item.
+  const original = '---\napple-note-id: "R1"\n---\n\n# Rent\n\nOrder 1 - 900\nOrder 2 - 1400\n- [ ] Deposit\nPaid in cash\n';
+  const file = (fixture) => path.join(fixture, 'Notes/Notes/Rent.md');
+  const s = await start('notes', (fixture) => fs.writeFileSync(file(fixture), original));
+  try {
+    const { page } = s;
+    await page.locator('.note-row', { hasText: 'Rent' }).first().dispatchEvent('mousedown');
+    await page.waitForTimeout(400);
+    const paragraphs = await page.locator('.note-body > p').allTextContents();
+    assert.deepEqual(paragraphs, ['', 'Order 1 - 900', 'Order 2 - 1400', 'Paid in cash']);
+    await page.locator('.note-body > p', { hasText: 'Order 2' }).click();
+    await page.keyboard.press('End');
+    await page.keyboard.type(' (late)');
+    await page.waitForTimeout(1200);
+    assert.equal(read(file(s.fixture)), original.replace('Order 2 - 1400', 'Order 2 - 1400 (late)'));
+    // Enter makes a new paragraph: a new line, not a blank one.
+    await page.keyboard.press('Enter');
+    await page.keyboard.type('Order 3 - 500');
+    await page.waitForTimeout(1200);
+    assert.equal(read(file(s.fixture)), original.replace('Order 2 - 1400\n', 'Order 2 - 1400 (late)\nOrder 3 - 500\n'));
   } finally {
     await s.done();
   }
@@ -245,6 +303,9 @@ test('reminders: tick, add, edit and delete go to iCloud through abridge rem', {
     await page.locator('button[title="New Reminder (Ctrl+N)"]').click();
     await page.keyboard.type('Plan the offsite');
     await page.keyboard.press('Enter');
+    // The next row's field takes focus once the first is added; typing before
+    // that lost the leading "- " now and then.
+    await page.waitForFunction(() => document.activeElement?.classList.contains('add-input') && document.activeElement.value === '');
     await page.keyboard.type('- buy snacks');
     await page.keyboard.press('Enter');
     await page.keyboard.press('Escape');

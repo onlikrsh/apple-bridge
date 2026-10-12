@@ -77,15 +77,18 @@ test('filename vaults: the title line becomes the name, a retitle is an apple-no
   const { root, v } = vault('filename');
   fs.writeFileSync(path.join(root, 'Shopping.md'), `---\napple-note-id: "N1"\n---\n\n- eggs\n`);
   assert.equal(v.scan().notes[0].title, 'Shopping');
-  v.write('Shopping.md', '# Shopping list\n\n- eggs\n- milk\n');
+  v.write('Shopping.md', '# Shopping list\n- eggs\n- milk\n');
   const text = fs.readFileSync(path.join(root, 'Shopping.md'), 'utf8');
   assert.match(text, /^apple-note-title: "Shopping list"$/m);
   assert.match(text, /apple-note-id: "N1"/);
   assert.ok(text.endsWith('\n- eggs\n- milk\n'));
   assert.ok(!text.includes('# Shopping list'));
-  const made = v.create('', '# Ideas\n\nfirst\n');
+  const made = v.create('', '# Ideas\nfirst\n');
   assert.equal(made.id, 'Ideas.md');
   assert.equal(fs.readFileSync(path.join(root, 'Ideas.md'), 'utf8'), 'first\n');
+  // Empty paragraphs right under the title are the note's, not a separator.
+  v.write('Ideas.md', '# Ideas\n\n\nfirst\n');
+  assert.equal(fs.readFileSync(path.join(root, 'Ideas.md'), 'utf8'), '\n\nfirst\n');
 });
 
 test('a write refuses to clobber a file a pull changed since it was loaded', () => {

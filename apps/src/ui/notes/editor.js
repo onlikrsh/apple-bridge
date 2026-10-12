@@ -20,6 +20,7 @@ import TableCell from '@tiptap/extension-table-cell';
 import Image from '@tiptap/extension-image';
 import Placeholder from '@tiptap/extension-placeholder';
 import { Markdown } from 'tiptap-markdown';
+import { noteLines, toEditor } from './lines.js';
 
 // tiptap-markdown only marks bullet and numbered lists as tight; without this
 // a checklist is written back with blank lines between its items.
@@ -41,45 +42,55 @@ const TightTaskLists = Extension.create({
   },
 });
 
-/** The note as Markdown, ending in one newline like icloud-md's own files. */
+/** The note as icloud-md's line-per-paragraph Markdown (lines.js), ending in
+ * one newline like icloud-md's own files. */
 export function noteMarkdown(editor) {
-  const md = editor.storage.markdown.getMarkdown();
-  return md.endsWith('\n') ? md : `${md}\n`;
+  return noteLines(editor);
+}
+
+/** Show a note: icloud-md's Markdown, read paragraph for paragraph. */
+export function setNote(editor, markdown) {
+  editor.commands.setContent(toEditor(markdown), false);
+}
+
+// Everything the editor understands; the reader below must parse exactly alike.
+export function extensions() {
+  return [
+    StarterKit.configure({
+      heading: { levels: [1, 2, 3] },
+      horizontalRule: false,
+      codeBlock: { HTMLAttributes: { class: 'mono' } },
+    }),
+    Underline,
+    Link.configure({ openOnClick: false, autolink: true, linkOnPaste: true }),
+    TaskList,
+    TightTaskLists,
+    TaskItem.configure({ nested: true }),
+    Table.configure({ resizable: false }),
+    TableRow,
+    TableHeader,
+    TableCell,
+    Image.configure({ inline: false }),
+    Placeholder.configure({
+      placeholder: ({ node, pos }) => (pos === 0 && node.type.name === 'heading' ? 'Title' : ''),
+      showOnlyCurrent: false,
+    }),
+    Markdown.configure({
+      html: true,
+      tightLists: true,
+      bulletListMarker: '-',
+      linkify: false,
+      breaks: false,
+      transformPastedText: true,
+      transformCopiedText: false,
+    }),
+  ];
 }
 
 export function createEditor(element, { onUpdate }) {
   return new Editor({
     element,
-    extensions: [
-      StarterKit.configure({
-        heading: { levels: [1, 2, 3] },
-        horizontalRule: false,
-        codeBlock: { HTMLAttributes: { class: 'mono' } },
-      }),
-      Underline,
-      Link.configure({ openOnClick: false, autolink: true, linkOnPaste: true }),
-      TaskList,
-      TightTaskLists,
-      TaskItem.configure({ nested: true }),
-      Table.configure({ resizable: false }),
-      TableRow,
-      TableHeader,
-      TableCell,
-      Image.configure({ inline: false }),
-      Placeholder.configure({
-        placeholder: ({ node, pos }) => (pos === 0 && node.type.name === 'heading' ? 'Title' : ''),
-        showOnlyCurrent: false,
-      }),
-      Markdown.configure({
-        html: true,
-        tightLists: true,
-        bulletListMarker: '-',
-        linkify: false,
-        breaks: false,
-        transformPastedText: true,
-        transformCopiedText: false,
-      }),
-    ],
+    extensions: extensions(),
     editorProps: {
       attributes: { class: 'note-body', spellcheck: 'true' },
       handleClickOn(view, pos, node, nodePos, event) {
@@ -94,4 +105,15 @@ export function createEditor(element, { onUpdate }) {
     },
     onUpdate: () => onUpdate(),
   });
+}
+
+/** An invisible second editor: what a Markdown text reads back as. A save
+ * only writes merged text (merge.js) that reads back exactly as the
+ * editor's own Markdown. */
+export function createReader() {
+  const reader = new Editor({ extensions: extensions() });
+  return (markdown) => {
+    setNote(reader, markdown);
+    return noteMarkdown(reader);
+  };
 }
