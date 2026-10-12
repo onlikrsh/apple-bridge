@@ -299,6 +299,12 @@ function setupCalendar() {
 
 function setupReminders() {
   const cacheFile = path.join(app.getPath('userData'), 'reminders.json');
+  let status = { state: 'idle', message: '', lastSync: null };
+  const setStatus = (patch) => {
+    status = { ...status, ...patch };
+    send('sync:status', status);
+  };
+  ipcMain.handle('sync:status', () => status);
   let chain = Promise.resolve();
   // CloudKit writes for one account go one at a time.
   const serial = (fn) => {
@@ -309,9 +315,9 @@ function setupReminders() {
 
   const mutate = (args) =>
     serial(async () => {
-      send('sync:status', { state: 'syncing' });
+      setStatus({ state: 'syncing' });
       const result = await abridge.run(['rem', ...args]);
-      send('sync:status', result.ok ? { state: 'idle', lastSync: Date.now() } : { state: 'error', message: abridge.errorLine(result) });
+      setStatus(result.ok ? { state: 'idle', lastSync: Date.now() } : { state: 'error', message: abridge.errorLine(result) });
       return { ok: result.ok, message: result.ok ? result.stdout.trim() : abridge.errorLine(result) };
     });
 
@@ -324,11 +330,11 @@ function setupReminders() {
   });
   ipcMain.handle('reminders:load', (_e, { completed } = {}) =>
     serial(async () => {
-      send('sync:status', { state: 'syncing' });
+      setStatus({ state: 'syncing' });
       const result = await abridge.run(['rem', 'dump', ...(completed ? ['--completed'] : [])]);
       if (!result.ok) {
         const message = abridge.errorLine(result);
-        send('sync:status', { state: 'error', message });
+        setStatus({ state: 'error', message });
         return { error: message };
       }
       const data = JSON.parse(result.stdout);
@@ -340,7 +346,7 @@ function setupReminders() {
       } catch {
         // The cache only makes the next start faster.
       }
-      send('sync:status', { state: 'idle', lastSync: Date.now() });
+      setStatus({ state: 'idle', lastSync: Date.now() });
       return data;
     }),
   );

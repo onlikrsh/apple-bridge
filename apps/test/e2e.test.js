@@ -221,3 +221,52 @@ test('calendar: repeating events ask before changing the series, and can lose on
     await s.done();
   }
 });
+
+// ----------------------------------------------------------------- reminders
+
+const calls = (s) => s.log().split('\n').filter((l) => l.startsWith('rem ') && !l.startsWith('rem dump'));
+
+test('reminders: tick, add, edit and delete go to iCloud through abridge rem', { skip }, async () => {
+  const s = await start('reminders');
+  try {
+    const { page } = s;
+    await page.waitForSelector('.rem-row');
+    // Today shows overdue + due today, with the right counts on the tiles.
+    assert.deepEqual(await page.locator('.rem-section').allTextContents(), ['Overdue', 'Today']);
+    assert.equal(await page.locator('.tile', { hasText: 'Flagged' }).locator('.tile-count').textContent(), '3');
+
+    // Tick "Pay electricity bill".
+    await page.locator('.rem-row', { hasText: 'Pay electricity bill' }).locator('.circle').click();
+    await page.waitForTimeout(300);
+    assert.ok(calls(s).includes('rem done A1000003-0000-4000-8000-000000000000'), calls(s).join('\n'));
+
+    // Add to Work with the inline row.
+    await page.locator('.list-row', { hasText: 'Work' }).click();
+    await page.locator('button[title="New Reminder (Ctrl+N)"]').click();
+    await page.keyboard.type('Plan the offsite');
+    await page.keyboard.press('Enter');
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(400);
+    assert.ok(calls(s).includes('rem add L-WORK Plan the offsite'), calls(s).join('\n'));
+
+    // Edit through the info popover: flag it and give it a time.
+    const row = page.locator('.rem-row', { hasText: 'Write release notes' });
+    await row.hover();
+    await row.locator('.info').click();
+    await page.locator('.info-line', { hasText: 'At a Time' }).locator('.switch').check();
+    await page.locator('.info-line', { hasText: 'At a Time' }).locator('input[type=time]').fill('14:30');
+    await page.locator('.info-line', { hasText: 'Flagged' }).locator('.switch').check();
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(400);
+    const editCall = calls(s).find((l) => l.startsWith('rem edit A1000010'));
+    assert.match(editCall, / --due \d{4}-\d\d-\d\d 14:30 --flag$/);
+
+    // Delete from the context menu.
+    await page.locator('.rem-row', { hasText: 'Review pull request' }).click({ button: 'right' });
+    await page.locator('.menu-item', { hasText: 'Delete' }).click();
+    await page.waitForTimeout(300);
+    assert.ok(calls(s).includes('rem rm A1000008-0000-4000-8000-000000000000'));
+  } finally {
+    await s.done();
+  }
+});
