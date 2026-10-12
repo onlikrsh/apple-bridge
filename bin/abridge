@@ -206,6 +206,14 @@ write_khal_config() {
 [[icloud]]
 path = $CALENDAR_DIR/*
 type = discover
+
+# ISO dates everywhere, so \`abridge cal list 2026-10-15 7d\` works in any locale.
+[locale]
+timeformat = %H:%M
+dateformat = %Y-%m-%d
+longdateformat = %Y-%m-%d
+datetimeformat = %Y-%m-%d %H:%M
+longdatetimeformat = %Y-%m-%d %H:%M
 EOF
 }
 
