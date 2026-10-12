@@ -29,6 +29,19 @@ if [ -z "${ICLOUD_MD_BROWSER_EXECUTABLE:-}" ] && [ -x /usr/bin/chromium ]; then
   export ICLOUD_MD_BROWSER_EXECUTABLE=/usr/bin/chromium
 fi
 
+# One sync per iCloud service at a time: the timer, the desktop apps and the
+# terminal would otherwise race each other over the same files and state.
+with_lock() {
+  local name="$1"
+  shift
+  mkdir -p "$ABRIDGE_STATE_DIR"
+  if ! have flock; then "$@"; return; fi
+  (
+    flock -w 300 9 || { warn "another $name sync is still running"; exit 1; }
+    "$@"
+  ) 9>"$ABRIDGE_STATE_DIR/$name.lock"
+}
+
 usage() {
   cat <<'EOF'
 abridge - iPhone and iCloud on Arch Linux
@@ -42,8 +55,13 @@ Setup
   abridge timer on|off|status      sync every 15 minutes in the background
   abridge doctor                   check what is installed and signed in
 
+Apps
+  abridge app notes|calendar|reminders
+                                   the macOS-style desktop apps (also in your app menu)
+
 Everyday
-  abridge sync                     sync everything that is set up
+  abridge sync [calendar|reminders|notes]
+                                   sync everything that is set up, or one part
   abridge cal [khal args]          calendar (default: next 7 days)
   abridge contacts [khard args]    contacts (default: list)
   abridge rem lists                reminder lists
@@ -391,6 +409,10 @@ EOF
 
 notes_pull() {
   notes_ready || die "notes are not set up. Run: abridge setup notes"
+  with_lock notes _notes_pull
+}
+
+_notes_pull() {
   # Check first: a stale session would otherwise open a sign-in window,
   # which a background timer has no way to show.
   if ! icloud_md verify-auth "$NOTES_DIR" >/dev/null 2>&1; then
@@ -405,6 +427,10 @@ notes_pull() {
 
 notes_push() {
   notes_ready || die "notes are not set up. Run: abridge setup notes"
+  with_lock notes _notes_push "$@"
+}
+
+_notes_push() {
   notes_commit "Local edits before push" || return 1
   icloud_md push "$NOTES_DIR" "$@" || return 1
   notes_commit "After push"
@@ -567,25 +593,62 @@ cmd_usb() {
 
 # -------------------------------------------------------------------- sync
 
+_calendar_sync() { vdirsyncer_run metasync && vdirsyncer_run sync; }
+
 cmd_sync() {
-  local failed=0 any=0
-  if [ -f "$VDIRSYNCER_CONF" ]; then
+  local only="${1:-}" failed=0 any=0
+  case "$only" in ""|calendar|contacts|reminders|notes) ;; *) die "usage: abridge sync [calendar|reminders|notes]" ;; esac
+  if [ -f "$VDIRSYNCER_CONF" ] && { [ -z "$only" ] || [ "$only" = calendar ] || [ "$only" = contacts ]; }; then
     any=1
     step "Calendar and contacts"
-    { vdirsyncer_run metasync && vdirsyncer_run sync; } || { warn "vdirsyncer failed"; failed=1; }
+    with_lock calendar _calendar_sync || { warn "vdirsyncer failed"; failed=1; }
   fi
-  if reminders_ready; then
+  if reminders_ready && { [ -z "$only" ] || [ "$only" = reminders ]; }; then
     any=1
     step "Reminders"
-    reminders_helper mirror || { warn "reminders mirror failed"; failed=1; }
+    with_lock reminders reminders_helper mirror || { warn "reminders mirror failed"; failed=1; }
   fi
-  if notes_ready; then
+  if notes_ready && { [ -z "$only" ] || [ "$only" = notes ]; }; then
     any=1
     step "Notes"
     notes_pull || failed=1
   fi
-  [ "$any" = 1 ] || warn "nothing is set up yet. Start with: abridge setup calendar"
+  if [ "$any" = 0 ]; then
+    if [ -n "$only" ]; then warn "$only is not set up yet. Run: abridge setup ${only/contacts/calendar}"
+    else warn "nothing is set up yet. Start with: abridge setup calendar"; fi
+  fi
   return "$failed"
+}
+
+# For the desktop apps: where everything lives, one KEY=value per line.
+cmd_paths() {
+  printf '%s=%s\n' \
+    APPLE_ID "${APPLE_ID:-}" \
+    NOTES_DIR "$NOTES_DIR" \
+    CALENDAR_DIR "$CALENDAR_DIR" \
+    CONTACTS_DIR "$CONTACTS_DIR" \
+    REMINDERS_DIR "$REMINDERS_DIR" \
+    CONFIG_DIR "$ABRIDGE_CONFIG_DIR" \
+    STATE_DIR "$ABRIDGE_STATE_DIR" \
+    DATA_DIR "$ABRIDGE_DATA_DIR"
+}
+
+find_electron() {
+  local e
+  for e in "${ABRIDGE_ELECTRON:-}" electron electron39 electron38 electron37; do
+    [ -n "$e" ] && have "$e" && { command -v "$e"; return; }
+  done
+  return 1
+}
+
+cmd_app() {
+  local name="${1:-}"
+  case "$name" in notes|calendar|reminders) ;; *) die "usage: abridge app notes|calendar|reminders" ;; esac
+  shift
+  local electron
+  electron="$(find_electron)" || die "Electron is not installed. Run: ./install.sh --only apps"
+  [ -f "$ABRIDGE_ROOT/apps/dist/main.js" ] || die "the apps are not built: $ABRIDGE_ROOT/apps/dist is missing"
+  ABRIDGE_BIN="$ABRIDGE_ROOT/bin/abridge" exec "$electron" "$ABRIDGE_ROOT/apps" --app="$name" "$@"
 }
 
 # ------------------------------------------------------------------- timer
@@ -680,7 +743,9 @@ main() {
         *) die "usage: abridge setup calendar|reminders|notes" ;;
       esac
       ;;
-    sync) cmd_sync ;;
+    sync) cmd_sync "$@" ;;
+    paths) cmd_paths ;;
+    app) cmd_app "$@" ;;
     cal|calendar) cmd_cal "$@" ;;
     contacts) cmd_contacts "$@" ;;
     rem|reminders) cmd_rem "$@" ;;
