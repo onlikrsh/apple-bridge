@@ -1,0 +1,193 @@
+apple-bridge's fix for icloud-md 0.6.2: uniform paragraph styles.
+
+Apple's text system takes a paragraph's style from its first character;
+icloud-md reads it (and verifies its pushes) from the paragraph's newline.
+Text a push inserts at a paragraph boundary inherits the neighbouring
+paragraph's attribute run, and the reconciler only corrected the fields the
+newline said were wrong, so typing at the start of a checklist item or
+heading, or retyping a line next to a table, could upload a paragraph that is
+one thing to icloud-md and another to the iPhone. Such a note passed
+icloud-md's verification and made Notes on the iPhone hang.
+
+This patch makes the reconciler rewrite any paragraph whose characters
+disagree, starting every piece from the paragraph's own style, and makes push
+refuse to upload (or create) a note that still has one. install.sh applies it
+with `patch -p1` in the package directory; tests/test_icloud_md_patch.py
+checks it.
+
+--- a/dist/commands/push.js
++++ b/dist/commands/push.js
+@@ -30,7 +30,7 @@
+ import { joinFrontmatter, splitFrontmatter } from "../notes/frontmatter.js";
+ import { parseNoteMarkdown } from "../notes/parseNoteMarkdown.js";
+ import { restoreTitleParagraphText, splitTitleParagraph, titleFromNoteFileName, titleParagraphFromFilename, } from "../notes/noteTitleParagraph.js";
+-import { reconcileNoteFormat } from "../notes/formatReconcile.js";
++import { mixedParagraphStyles, reconcileNoteFormat } from "../notes/formatReconcile.js";
+ import { prepareTableAttachmentUpdate } from "../notes/tablePushEdit.js";
+ import { historyRecordNames } from "../notes/trackedFile.js";
+ import { recordVersion } from "../notes/versionHistory.js";
+@@ -800,6 +800,17 @@
+                 entries.push({ kind: "create", file, resolution: "refused", reason: reconciled.reason });
+                 continue;
+             }
++            // apple-bridge patch: see mixedParagraphStyles.
++            const mixed = mixedParagraphStyles(doc.text, doc.attributeRuns);
++            if (mixed.length > 0) {
++                entries.push({
++                    kind: "create",
++                    file,
++                    resolution: "refused",
++                    reason: `line ${mixed[0] + 1} would have mixed formatting, which can make Notes freeze on your other devices - refusing to create`,
++                });
++                continue;
++            }
+             const compressed = compressNoteDocument(encodeNoteDocument(doc));
+             const rebuiltString = decodeNoteString(compressed);
+             const rebuiltFormat = decodeNoteFormat(rebuiltString.string, rebuiltString.attributeRun);
+@@ -1570,6 +1581,15 @@
+             return { status: "unchanged" };
+         }
+         validateDocumentInvariants(doc);
++        // apple-bridge patch: never upload a paragraph whose characters
++        // disagree on their paragraph style - the reconciler should never
++        // leave one, and Notes on the iPhone can hang on it.
++        const mixed = mixedParagraphStyles(doc.text, doc.attributeRuns);
++        if (mixed.length > 0) {
++            summary.refused.push(`${entry.file}: this edit would leave line ${mixed[0] + 1} with mixed formatting, which can make Notes freeze on your other devices - refusing to push. ` +
++                `Run "icloud-md restore ${entry.file}" to discard your local edit.`);
++            return undefined;
++        }
+         const compressed = compressNoteDocument(encodeNoteDocument(doc));
+         if (decodeNoteBodyText(compressed) !== desired.text) {
+             summary.refused.push(`${entry.file}: rebuilt document failed decode verification - refusing to push`);
+--- a/dist/notes/formatReconcile.js
++++ b/dist/notes/formatReconcile.js
+@@ -35,6 +35,77 @@
+     todoList: 103,
+ };
+ /**
++ * apple-bridge patch: uniform paragraph styles.
++ *
++ * Apple's text system takes a paragraph's style from its first character;
++ * this tool's decoder (and so its push verification) reads it from the
++ * paragraph's newline. The two agree only when every character of the
++ * paragraph carries the same paragraphStyle. A splice can break that: text
++ * inserted at a paragraph boundary inherits the neighbouring paragraph's run
++ * (`adjustAttributeRuns`), and the overlay below only fixed the fields the
++ * newline's projection said were wrong. The result - say a checklist line
++ * whose characters are Body with one todo uuid while its newline is a
++ * checklist with another - passes verification here and leaves Notes on the
++ * iPhone unresponsive.
++ *
++ * Returns the indexes of paragraphs whose characters disagree on any
++ * paragraph-style field's effective value (an unset field reads as its
++ * default, as on Apple's side: Apple's own notes mix explicit and implicit
++ * zeros freely).
++ */
++export function mixedParagraphStyles(text, attributeRuns) {
++    const intervals = [];
++    let at = 0;
++    for (const run of attributeRuns) {
++        if (run.length > 0) {
++            intervals.push({ start: at, end: at + run.length, key: paragraphStyleKey(run.paragraphStyle) });
++        }
++        at += run.length;
++    }
++    const mixed = [];
++    const lines = text.split("\n");
++    let start = 0;
++    let next = 0;
++    for (let i = 0; i < lines.length; i += 1) {
++        const end = start + lines[i].length + (i < lines.length - 1 ? 1 : 0);
++        while (next < intervals.length && intervals[next].end <= start) {
++            next += 1;
++        }
++        let key;
++        for (let j = next; j < intervals.length && intervals[j].start < end; j += 1) {
++            if (key === undefined) {
++                key = intervals[j].key;
++            }
++            else if (intervals[j].key !== key) {
++                mixed.push(i);
++                break;
++            }
++        }
++        start = end;
++    }
++    return mixed;
++}
++function paragraphStyleKey(paragraphStyle) {
++    return effectiveValueKey(ParagraphStyleSchema, paragraphStyle ?? create(ParagraphStyleSchema));
++}
++function effectiveValueKey(schema, message) {
++    const parts = [];
++    for (const field of schema.fields) {
++        let value = message[field.localName];
++        if (field.fieldKind === "message") {
++            value = value === undefined ? null : effectiveValueKey(field.message, value);
++        }
++        else if (value instanceof Uint8Array) {
++            value = Buffer.from(value).toString("hex");
++        }
++        else if (typeof value === "bigint") {
++            value = value.toString();
++        }
++        parts.push(value);
++    }
++    return JSON.stringify(parts);
++}
++/**
+  * Reconciles `doc`'s formatting to `desired`. `doc.text` must already equal
+  * the desired plain text (same paragraph structure) - the text splice runs
+  * first, this second. Returns whether anything changed; refuses (rather
+@@ -92,10 +163,16 @@
+             needsStartRepair.add(i);
+         }
+     }
++    // apple-bridge patch: a paragraph whose characters disagree on their
++    // paragraph style (see mixedParagraphStyles) is always rewritten, and the
++    // rewrite below makes it uniform again - even when its projection, read
++    // from the newline alone, already matches.
++    const needsUniformStyle = new Set(mixedParagraphStyles(doc.text, doc.attributeRuns));
+     const changedIndexes = [];
+     for (let i = 0; i < desired.length; i += 1) {
+         if (needsFreshTodoUuid.has(i) ||
+             needsStartRepair.has(i) ||
++            needsUniformStyle.has(i) ||
+             !paragraphProjectionsEqual(current.paragraphs[i], desired[i], current.paragraphs[i - 1], desired[i - 1])) {
+             changedIndexes.push(i);
+         }
+@@ -196,6 +273,12 @@
+             boundaries.add(interval.end);
+         }
+     }
++    // apple-bridge patch: the style each changed paragraph's pieces start
++    // from - its newline's (or last character's) run, the one the projection
++    // was read from - rather than whatever run each piece was cut from.
++    for (const plan of plans) {
++        plan.anchorStyle = plan.end > plan.start ? paragraphStyleAt(runs, plan.end - 1) : undefined;
++    }
+     const out = [];
+     // Only pieces minted here may merge (and be mutated) afterwards -
+     // untouched original runs pass through by reference and must stay intact.
+@@ -228,7 +311,20 @@
+     }
+     return mergeEncodableEqualRuns(out, rewritten);
+ }
++function paragraphStyleAt(runs, index) {
++    let offset = 0;
++    for (const run of runs) {
++        if (index >= offset && index < offset + run.length) {
++            return run.paragraphStyle;
++        }
++        offset += run.length;
++    }
++    return undefined;
++}
+ function overlayPiece(piece, plan, pieceStart) {
++    // apple-bridge patch: every piece of the paragraph starts from the same
++    // style, so the overlay leaves them all identical.
++    piece.paragraphStyle = plan.anchorStyle === undefined ? undefined : clone(ParagraphStyleSchema, plan.anchorStyle);
+     overlayParagraphStyle(piece, plan);
+     const currentStyle = styleAt(plan.currentSpans, pieceStart);
+     const desiredStyle = styleAt(plan.desiredSpans, pieceStart);

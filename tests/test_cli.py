@@ -27,6 +27,11 @@ FAKES = ROOT / "tests" / "fakes"
 TOOLS = os.environ.get("ABRIDGE_TEST_TOOLS", "")
 TOOL_PATH = os.pathsep.join(p for p in (TOOLS, os.environ.get("PATH", "")) if p)
 
+REAL_ICLOUD_MD = Path(
+    os.environ.get("ABRIDGE_TEST_ICLOUD_MD", Path.home() / ".local/share/apple-bridge/node/lib/node_modules/icloud-md")
+)
+WRITE_FIELDS = ["LastModifiedDate", "ResolutionTokenMap"]  # in every write
+
 LIST_SHOP = "List/AAAA0000-1111-2222-3333-444455556666"
 LIST_WORK = "List/BBBB0000-1111-2222-3333-444455556666"
 
@@ -75,6 +80,10 @@ case "$1" in
 esac
 """,
     )
+    # What install.sh's icloud-md patch leaves behind (see test_notes_push_needs_the_paragraph_fix).
+    reconciler = data / "node/lib/node_modules/icloud-md/dist/notes/formatReconcile.js"
+    reconciler.parent.mkdir(parents=True)
+    reconciler.write_text("// apple-bridge patch: uniform paragraph styles\n")
     (tmp_path / "icloud.json").write_text(
         json.dumps(
             {
@@ -178,12 +187,16 @@ def test_rem_add_sends_apple_style_dates_and_priorities(ab):
 
 
 def test_rem_done_undo_rm_by_short_id(ab):
+    done = {"modify": "AB12CD34-0000", "fields": sorted(["Completed", "CompletionDate", *WRITE_FIELDS])}
     ab.run("rem", "done", "ab12")
-    assert ab.state()["calls"][-1] == {"update": "AB12CD34-0000", "completed": True}
+    assert ab.state()["calls"][-1] == done
+    assert ab.state()["updated"]["completed"] is True
     ab.run("rem", "undo", "AB12CD34")
-    assert ab.state()["calls"][-1] == {"update": "AB12CD34-0000", "completed": False}
+    assert ab.state()["calls"][-1] == done
+    assert (ab.state()["updated"]["completed"], ab.state()["updated"]["completed_date"]) == (False, None)
     ab.run("rem", "rm", "99887766")
-    assert ab.state()["calls"][-1] == {"delete": "99887766-0000"}
+    assert ab.state()["calls"][-1] == {"modify": "99887766-0000", "fields": sorted(["Deleted", *WRITE_FIELDS])}
+    assert "Send report" not in ab.run("rem", "ls").stdout
 
 
 def test_rem_dump_is_what_the_app_reads(ab):
@@ -201,16 +214,123 @@ def test_rem_dump_is_what_the_app_reads(ab):
     assert {r["title"] for r in full["reminders"]} == {"Milk", "Bread", "Send report"}
 
 
-def test_rem_edit_changes_only_what_was_asked(ab):
-    ab.run("rem", "edit", "ab12", "--title", "Oat milk", "--due", "2026-11-01 08:15", "--flag")
+def test_rem_edit_writes_only_what_changed(ab):
+    ab.run("rem", "edit", "ab12", "--due", "2026-11-01 08:15", "--flag")
+    assert ab.state()["calls"][-1]["fields"] == sorted(["DueDate", "Flagged", "TimeZone", *WRITE_FIELDS])
     updated = ab.state()["updated"]
-    assert (updated["title"], updated["flagged"], updated["all_day"]) == ("Oat milk", True, False)
+    assert (updated["flagged"], updated.get("all_day", False), updated["time_zone"]) == (True, False, "UTC")
     assert updated["due_date"] == "2026-11-01T08:15:00+00:00"
+    # The report: all-day, high priority, not flagged.
     ab.run("rem", "edit", "99887766", "--no-due", "--no-flag", "-p", "low")
+    assert ab.state()["calls"][-1]["fields"] == sorted(["AllDay", "DueDate", "Priority", *WRITE_FIELDS])
     updated = ab.state()["updated"]
-    assert (updated["due_date"], updated["flagged"], updated["priority"]) == (None, False, 9)
+    assert (updated["due_date"], updated["all_day"], updated["priority"]) == (None, False, 9)
+    calls = len(ab.state()["calls"])
+    assert ab.run("rem", "edit", "99887766", "-p", "low", "--notes", "").stdout.startswith("unchanged: Send report")
+    assert len(ab.state()["calls"]) == calls
     proc = ab.run("rem", "edit", "ab12", "--title", "  ", ok=False)
     assert proc.returncode == 1 and "cannot be empty" in proc.stderr
+
+
+def test_rem_writes_advance_only_their_own_fields_tokens(ab):
+    # How Apple's clients tell which change to a field is newest.
+    state = ab.state()
+    milk = record(state, "reminders", "Reminder/AB12CD34-0000")
+    milk["tokens"] = {
+        "completed": {"counter": 5, "modificationTime": 1.0, "replicaID": "A"},
+        "titleDocument": {"counter": 3, "modificationTime": 1.0, "replicaID": "B"},
+        "list": {"counter": 2, "modificationTime": 1.0, "replicaID": "C"},
+    }
+    Path(ab.env["FAKE_ICLOUD_STATE"]).write_text(json.dumps(state))
+    ab.run("rem", "done", "ab12")
+    tokens = record(ab.state(), "reminders", "Reminder/AB12CD34-0000")["tokens"]
+    assert tokens["completed"]["counter"] == 6 and tokens["completed"]["replicaID"] not in ("A", "B", "C")
+    assert tokens["completed"]["modificationTime"] > 800_000_000  # seconds since 2001
+    assert tokens["completionDate"]["counter"] == 1 and tokens["lastModifiedDate"]["counter"] == 1
+    assert tokens["titleDocument"] == {"counter": 3, "modificationTime": 1.0, "replicaID": "B"}
+    assert tokens["list"] == {"counter": 2, "modificationTime": 1.0, "replicaID": "C"}
+
+
+def test_rem_done_leaves_repeating_and_finished_reminders_alone(ab):
+    state = ab.state()
+    record(state, "reminders", "Reminder/AB12CD34-0000")["recurrence_rule_ids"] = ["RecurrenceRule/1"]
+    Path(ab.env["FAKE_ICLOUD_STATE"]).write_text(json.dumps(state))
+    proc = ab.run("rem", "done", "99887766", "ab12", ok=False)
+    assert proc.returncode == 1 and '"Milk" repeats' in proc.stderr
+    assert ab.state()["calls"] == []  # checked before anything was written
+    assert ab.run("rem", "done", "ef56").stdout.startswith("already done: Bread")
+    assert ab.state()["calls"] == []
+
+
+def test_rem_write_conflict_is_a_clear_error(ab):
+    state = ab.state()
+    state["conflict"] = True
+    Path(ab.env["FAKE_ICLOUD_STATE"]).write_text(json.dumps(state))
+    proc = ab.run("rem", "done", "ab12", ok=False)
+    assert proc.returncode == 1 and "changed on another device" in proc.stderr
+
+
+INSPECT_DOCUMENT = """
+import { gunzipSync } from 'node:zlib';
+import { pathToFileURL } from 'node:url';
+const nd = await import(pathToFileURL(process.argv[1] + '/dist/notes/noteDocument.js').href);
+const doc = nd.parseNoteDocument(gunzipSync(Buffer.from(process.argv[2], 'base64')));
+console.log(JSON.stringify({
+  text: doc.text,
+  replicas: doc.replicas.map((r) => r.counters),
+  runs: doc.runs.map((r) => ({ replica: r.coord.replica, clock: r.coord.clock, length: r.length, tombstone: r.tombstone })),
+}));
+"""
+
+
+def with_icloud_md(ab):
+    """Title and notes edits run icloud-md's CRDT editor (libexec/abridge-topotext.mjs)."""
+    if not ((REAL_ICLOUD_MD / "dist/notes/noteDocument.js").exists() and tool("node")):
+        pytest.skip("needs node and icloud-md (or ABRIDGE_TEST_ICLOUD_MD)")
+    ab.env["ABRIDGE_ICLOUD_MD_PKG"] = str(REAL_ICLOUD_MD)
+
+
+def inspect_document(value: str) -> dict:
+    proc = subprocess.run(
+        ["node", "--input-type=module", "-e", INSPECT_DOCUMENT, str(REAL_ICLOUD_MD), value],
+        capture_output=True, text=True, check=True,
+    )
+    return json.loads(proc.stdout)
+
+
+def test_rem_title_edits_continue_one_document(ab):
+    with_icloud_md(ab)
+    ab.run("rem", "edit", "--title=Oat milk", "--", "ab12")
+    assert ab.state()["calls"][-1]["fields"] == sorted(["TitleDocument", *WRITE_FIELDS])
+    assert ab.state()["updated"]["title"] == "Oat milk"
+    replica = (ab.home / ".local/state/apple-bridge/reminders-replica").read_text()
+    # What the app sends: options as --opt=value, positionals after --.
+    ab.run("rem", "edit", "--title=-1 day left", "--", "ab12")
+    milk = ab.state()["updated"]
+    assert milk["title"] == "-1 day left"
+    assert (ab.home / ".local/state/apple-bridge/reminders-replica").read_text() == replica
+    doc = inspect_document(milk["title_doc"])
+    assert doc["text"] == "-1 day left"
+    # One replica (ours) wrote both versions: the first title's characters are
+    # kept as tombstones, and no character id was used twice.
+    assert len(doc["replicas"]) == 1
+    ours = sorted((r["clock"], r["clock"] + r["length"]) for r in doc["runs"] if r["replica"] == 1)
+    assert all(a_end <= b_start for (_, a_end), (b_start, _) in zip(ours, ours[1:]))
+    inserted = sum(end - start for start, end in ours)
+    assert inserted == doc["replicas"][0][0]  # our clock counts each character once
+    assert inserted > len("-1 day left")  # the old characters are still there
+    assert any(r["tombstone"] for r in doc["runs"])
+
+
+def test_rem_notes_are_only_written_when_there_are_some(ab):
+    with_icloud_md(ab)
+    calls = len(ab.state()["calls"])
+    assert ab.run("rem", "edit", "ab12", "--notes", "").stdout.startswith("unchanged")
+    assert len(ab.state()["calls"]) == calls  # no empty NotesDocument added
+    ab.run("rem", "edit", "ab12", "--notes", "free range")
+    assert ab.state()["calls"][-1]["fields"] == sorted(["NotesDocument", *WRITE_FIELDS])
+    assert ab.state()["updated"]["desc"] == "free range"
+    assert inspect_document(ab.state()["updated"]["notes_doc"])["text"] == "free range"
 
 
 def test_rem_full_uuid_is_looked_up_directly(ab):
@@ -219,7 +339,8 @@ def test_rem_full_uuid_is_looked_up_directly(ab):
     state["reminders"].append({"id": full, "list_id": LIST_SHOP, "title": "Eggs"})
     Path(ab.env["FAKE_ICLOUD_STATE"]).write_text(json.dumps(state))
     ab.run("rem", "done", "0E9A1F2B-1234-5678-9ABC-DEF012345678")
-    assert ab.state()["calls"][-1] == {"update": "0E9A1F2B-1234-5678-9ABC-DEF012345678", "completed": True}
+    assert ab.state()["calls"][-1]["modify"] == "0E9A1F2B-1234-5678-9ABC-DEF012345678"
+    assert not any("list_reminders" in r for r in ab.state().get("reads", []))  # one lookup, no listing
 
 
 def test_rem_unknown_list_and_ambiguous_id_are_clear_errors(ab):
@@ -247,6 +368,136 @@ def test_rem_mirror_is_readable_by_todoman(ab):
     listing = ab.run("todo", "list").stdout
     assert "Milk" in listing and "Send report" in listing
     assert "Bread" not in listing  # todoman hides completed by default
+
+
+def on_phone(ab, edit):
+    """Change iCloud the way the iPhone would. edit(state) changes it in place
+    and returns the records it touched, which get the next change number, as
+    with CloudKit's sync tokens. A deletion returns a tombstone it added."""
+    state = ab.state()
+    for raw in edit(state):
+        state["seq"] = state.get("seq", 0) + 1
+        raw["seq"] = state["seq"]
+    Path(ab.env["FAKE_ICLOUD_STATE"]).write_text(json.dumps(state))
+
+
+def reads(ab, kind):
+    return [r[kind] for r in ab.state().get("reads", []) if kind in r]
+
+
+def record(state, kind, rid):
+    return next(r for r in state[kind] if r["id"] == rid)
+
+
+def test_rem_lists_come_from_a_cache_kept_up_to_date(ab):
+    ab.run("rem", "lists")
+    assert reads(ab, "list_changes") == [None]  # the first time, everything
+
+    def rename_and_add(state):
+        work = record(state, "lists", LIST_WORK)
+        work["title"] = "Office"
+        travel = {"id": "List/CCCC0000-1111-2222-3333-444455556666", "title": "Travel"}
+        state["lists"].append(travel)
+        return [work, travel]
+
+    on_phone(ab, rename_and_add)
+    out = ab.run("rem", "lists").stdout
+    assert "Office" in out and "Travel" in out and "Work" not in out
+    assert reads(ab, "list_changes") == [None, "0"]
+
+    def delete_shopping(state):
+        state["lists"] = [l for l in state["lists"] if l["id"] != LIST_SHOP]
+        tombstone = {"id": LIST_SHOP}
+        state.setdefault("tombstones", []).append(tombstone)
+        return [tombstone]
+
+    on_phone(ab, delete_shopping)
+    assert "Shopping" not in ab.run("rem", "lists").stdout
+    assert reads(ab, "list_changes") == [None, "0", "2"]
+    assert reads(ab, "lists") == []  # pyicloud's own full walk was never needed
+
+
+def test_rem_lists_cache_starts_over_when_it_cannot_continue(ab):
+    cache = ab.home / ".local/state/apple-bridge/reminders-lists.json"
+    ab.run("rem", "lists")
+
+    def tweak(**fields):
+        cache.write_text(json.dumps({**json.loads(cache.read_text()), **fields}))
+
+    state = ab.state()
+    state["seq"] = state["oldest_token"] = 5  # iCloud no longer knows our token
+    Path(ab.env["FAKE_ICLOUD_STATE"]).write_text(json.dumps(state))
+    assert "Shopping" in ab.run("rem", "lists").stdout
+    assert reads(ab, "list_changes") == [None, "0", None]
+
+    tweak(full=json.loads(cache.read_text())["full"] - 86400)  # a day old
+    ab.run("rem", "lists")
+    tweak(apple_id="someone@icloud.com")
+    ab.run("rem", "lists")
+    cache.write_text("{")
+    ab.run("rem", "lists")
+    assert reads(ab, "list_changes")[3:] == [None, None, None]
+    ab.run("rem", "lists")
+    assert reads(ab, "list_changes")[-1] == "5"
+
+
+def test_rem_mirror_fetches_only_what_changed(ab):
+    shop = ab.data / "reminders" / LIST_SHOP.split("/")[1]
+    work = ab.data / "reminders" / LIST_WORK.split("/")[1]
+    assert "2 lists, 3 written" in ab.run("rem", "mirror").stdout
+    whole_lists = len(reads(ab, "list_reminders"))
+    assert whole_lists == 2  # the first time, everything
+    assert "0 written, 3 unchanged, 0 removed" in ab.run("rem", "mirror").stdout
+
+    def edits(state):
+        milk = record(state, "reminders", "Reminder/AB12CD34-0000")
+        milk["title"] = "Oat milk"
+        report = record(state, "reminders", "Reminder/99887766-0000")
+        report["list_id"] = LIST_SHOP  # moved
+        state["reminders"] = [r for r in state["reminders"] if r["id"] != "Reminder/EF56AB78-0000"]
+        bread = {"id": "Reminder/EF56AB78-0000"}
+        state.setdefault("tombstones", []).append(bread)
+        new = {"id": "Reminder/12345678-0000", "list_id": LIST_WORK, "title": "Call Ada"}
+        state["reminders"].append(new)
+        return [milk, report, bread, new]
+
+    on_phone(ab, edits)
+    assert "3 written, 0 unchanged, 2 removed" in ab.run("rem", "mirror").stdout
+    assert len(reads(ab, "list_reminders")) == whole_lists
+    assert sorted(p.name for p in shop.glob("*.ics")) == ["99887766-0000.ics", "AB12CD34-0000.ics"]
+    assert [p.name for p in work.glob("*.ics")] == ["12345678-0000.ics"]
+    assert "SUMMARY:Oat milk" in (shop / "AB12CD34-0000.ics").read_text()
+    assert "CATEGORIES:Shopping" in (shop / "99887766-0000.ics").read_text()
+
+    # Every file carries its list's name, so a renamed list is copied whole.
+    def rename(state):
+        work_list = record(state, "lists", LIST_WORK)
+        work_list["title"] = "Office"
+        return [work_list]
+
+    on_phone(ab, rename)
+    ab.run("rem", "mirror")
+    assert reads(ab, "list_reminders")[whole_lists:] == [LIST_WORK.split("/")[1]]
+    assert (work / "displayname").read_text() == "Office"
+    assert "CATEGORIES:Office" in (work / "12345678-0000.ics").read_text()
+
+
+def test_rem_mirror_copies_everything_when_it_cannot_continue(ab):
+    saved = ab.data / "reminders/.abridge-sync.json"
+    ab.run("rem", "mirror")
+    state = ab.state()
+    state["seq"] = state["oldest_token"] = 9  # iCloud no longer knows our token
+    Path(ab.env["FAKE_ICLOUD_STATE"]).write_text(json.dumps(state))
+    ab.run("rem", "mirror")
+    assert len(reads(ab, "list_reminders")) == 4
+    assert json.loads(saved.read_text())["token"] == "9"
+
+    saved.write_text(json.dumps({**json.loads(saved.read_text()), "full": 0}))  # long ago
+    ab.run("rem", "mirror")
+    assert len(reads(ab, "list_reminders")) == 6
+    ab.run("rem", "mirror")
+    assert len(reads(ab, "list_reminders")) == 6
+    assert reads(ab, "reminder_changes")[-1] == "9"
 
 
 # ---------------------------------------------------------- calendar/contacts
@@ -345,6 +596,15 @@ def test_notes_clone_pull_push_keep_a_git_history(ab):
     ab.run("notes", "push", "--dry-run")
     assert git(ab, "log", "-1", "--format=%s").strip() == "Local edits before push"
     assert (ab.home / "icloud-md.log").read_text().splitlines()[-1].endswith("Notes --dry-run")
+
+
+def test_notes_push_needs_the_paragraph_fix(ab):
+    ab.run("setup", "notes", input="n\n")
+    (ab.data / "node/lib/node_modules/icloud-md/dist/notes/formatReconcile.js").write_text("// as released\n")
+    proc = ab.run("notes", "push", ok=False)
+    assert proc.returncode == 1 and "install.sh" in proc.stderr
+    assert not any(line.startswith("push") for line in (ab.home / "icloud-md.log").read_text().splitlines())
+    assert "without apple-bridge's paragraph fix" in ab.run("doctor", ok=False).stderr
 
 
 def test_notes_pull_with_expired_sign_in_fails_without_touching_files(ab):
@@ -461,9 +721,11 @@ def test_pair_overview(ab):
 
 
 def test_app_without_electron_says_how_to_get_it(ab):
-    proc = ab.run("app", "notes", ok=False)
-    if proc.returncode == 0:
+    # The names find_electron tries. With one installed, the app would really
+    # start (and, with no display in this environment, crash).
+    if any(tool(e) for e in ("electron", "electron39", "electron38", "electron37")):
         pytest.skip("electron is installed here")
+    proc = ab.run("app", "notes", ok=False)
     assert "pacman" in proc.stderr or "dist is missing" in proc.stderr
 
 
@@ -472,5 +734,4 @@ def test_rem_titles_starting_with_a_dash(ab):
     ab.run("rem", "add", "--due=2026-10-21", "--", "Shopping", "- buy snacks")
     call = ab.state()["calls"][-1]["create"]
     assert (call["title"], call["list_id"], call["all_day"]) == ("- buy snacks", LIST_SHOP, True)
-    ab.run("rem", "edit", "--title=-1 day left", "--", "ab12")
-    assert ab.state()["updated"]["title"] == "-1 day left"
+    # (Editing a title that starts with a dash: test_rem_title_edits_continue_one_document.)

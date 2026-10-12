@@ -45,6 +45,9 @@ What is **not** possible today, and why:
   instead (see the docs).
 - **Note attachments**: they download, but edits to notes that contain them
   are refused rather than risk corrupting the note.
+- **Completing a repeating reminder from Linux**: the iPhone moves it to its
+  next date, and abridge can't yet; `abridge rem done` refuses rather than
+  end the series. Complete those on the phone.
 - **Creating Reminders lists**: Apple's web API has no call for it. Create
   them on the phone.
 - **Automatic Universal Clipboard, Handoff, iMessage, calls**: iOS reserves
@@ -204,6 +207,8 @@ and your Wi-Fi stays connected.
 | `~/.config/apple-bridge/*.conf` | generated vdirsyncer, khal, khard, todoman configs |
 | keyring, or `~/.config/apple-bridge/app-password` (0600) | the app-specific password |
 | `~/.local/state/apple-bridge/pyicloud/` | Reminders session (pyicloud's default, `/tmp`, is wiped at every reboot on Arch) |
+| `~/.local/state/apple-bridge/reminders-lists.json` | your Reminders lists and a sync token, so commands don't refetch them (safe to delete) |
+| `~/.local/state/apple-bridge/reminders-replica` | this computer's id in reminder titles and notes, which it edits as CRDT documents |
 | `~/.config/icloud-md/accounts/` | Notes session |
 | `~/.local/share/apple-bridge/{calendars,contacts,reminders}/` | synced data, as vdirs of .ics/.vcf |
 | `~/Notes/` | your notes, as Markdown in a git repo |
@@ -246,6 +251,8 @@ cd apps
 npm ci                                    # dev only: Electron, esbuild, TipTap, ical.js, Lucide
 node build.mjs --minify                   # rebuild apps/dist (committed)
 node --test test/*.test.js                # backends; with DISPLAY set also drives the real apps
+# On a Wayland desktop, drive them through XWayland, with the system Electron:
+env -u WAYLAND_DISPLAY ELECTRON_OVERRIDE_DIST_PATH=/usr/lib/electron node --test test/*.test.js
 node test/screenshots.js /tmp/shots       # the screenshots above, from a demo account
 ```
 

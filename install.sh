@@ -50,7 +50,8 @@ ok "linked ~/.local/bin/abridge -> $REPO/bin/abridge"
 packages=(git python libsecret)
 want calendar && packages+=(vdirsyncer khal khard)
 want reminders && packages+=(todoman)
-want notes && packages+=(nodejs npm chromium)
+want notes && packages+=(nodejs npm chromium patch)
+want reminders && packages+=(nodejs npm patch)  # icloud-md edits reminder titles and notes
 want usb && packages+=(libimobiledevice usbmuxd ifuse rsync libheif)
 # The apps run on the system Electron (no npm needed: apps/dist is prebuilt).
 # Inter is the open font closest to Apple's SF Pro, which they fall back to.
@@ -94,8 +95,8 @@ fi
 
 # --------------------------------------------------------------- icloud-md
 
-if want notes; then
-  step "icloud-md $ABRIDGE_ICLOUD_MD_VERSION (Notes)"
+if want notes || want reminders; then
+  step "icloud-md $ABRIDGE_ICLOUD_MD_VERSION (Notes, and editing reminder titles)"
   have node || die "node is not installed"
   node -e 'process.exit(+process.versions.node.split(".")[0] >= 20 ? 0 : 1)' \
     || die "icloud-md needs Node.js 20 or newer"
@@ -104,7 +105,21 @@ if want notes; then
     "icloud-md@$ABRIDGE_ICLOUD_MD_VERSION"
   [ -x "$ABRIDGE_NODE_PREFIX/bin/icloud-md" ] || die "icloud-md did not install"
   ok "icloud-md in $ABRIDGE_NODE_PREFIX"
-  have chromium || warn "no system chromium; icloud-md will download its own browser (~150 MB) at sign-in"
+  # Our fix for paragraphs that freeze Notes on the iPhone (see the patch's
+  # header). npm leaves an installed package alone, so it may be there already.
+  icloud_md_patch="$REPO/share/patches/icloud-md-$ABRIDGE_ICLOUD_MD_VERSION.patch"
+  if [ ! -f "$icloud_md_patch" ]; then
+    warn "no paragraph fix for icloud-md $ABRIDGE_ICLOUD_MD_VERSION; abridge will refuse to push notes"
+  elif icloud_md_patched; then
+    ok "icloud-md paragraph fix already applied"
+  elif patch -d "$ABRIDGE_ICLOUD_MD_PKG" -p1 -N -s <"$icloud_md_patch"; then
+    ok "applied the icloud-md paragraph fix"
+  else
+    die "the icloud-md paragraph fix did not apply to $ABRIDGE_ICLOUD_MD_PKG"
+  fi
+  if want notes && ! have chromium; then
+    warn "no system chromium; icloud-md will download its own browser (~150 MB) at sign-in"
+  fi
 fi
 
 # --------------------------------------------------------------- localsend

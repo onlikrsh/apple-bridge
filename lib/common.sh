@@ -12,6 +12,7 @@ ABRIDGE_CONFIG="$ABRIDGE_CONFIG_DIR/config"
 ABRIDGE_PYICLOUD_SESSION="$ABRIDGE_STATE_DIR/pyicloud"
 ABRIDGE_VENV="$ABRIDGE_DATA_DIR/venv"
 ABRIDGE_NODE_PREFIX="$ABRIDGE_DATA_DIR/node"
+ABRIDGE_ICLOUD_MD_PKG="${ABRIDGE_ICLOUD_MD_PKG:-$ABRIDGE_NODE_PREFIX/lib/node_modules/icloud-md}"
 ABRIDGE_SRC_DIR="$ABRIDGE_DATA_DIR/src"
 ABRIDGE_APP_PASSWORD_FILE="$ABRIDGE_CONFIG_DIR/app-password"
 
@@ -33,6 +34,12 @@ ok()   { printf '    ok: %s\n' "$*" >&2; }
 warn() { printf '    %swarning:%s %s\n' "$_y" "$_n" "$*" >&2; }
 die()  { printf '%serror:%s %s\n' "$_r" "$_n" "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# share/patches/icloud-md-*.patch, applied by install.sh. Unpatched, some
+# edits pushed from Linux leave notes that make Notes on the iPhone hang.
+icloud_md_patched() {
+  grep -q 'apple-bridge patch: uniform paragraph styles' "$ABRIDGE_ICLOUD_MD_PKG/dist/notes/formatReconcile.js" 2>/dev/null
+}
 
 # Ask a yes/no question; $2 is the default (y or n). ABRIDGE_YES=1 answers yes.
 confirm() {

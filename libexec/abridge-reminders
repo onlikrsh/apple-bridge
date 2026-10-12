@@ -7,7 +7,9 @@ talks to that database through pyicloud and adds:
 
   * name-based list selection and short ids, so you never paste a UUID;
   * a one-way mirror of every reminder into a vdir of VTODO .ics files, which
-    todoman (and anything else that reads vdirs) can display offline.
+    todoman (and anything else that reads vdirs) can display offline;
+  * CloudKit sync tokens for the list of lists and for the mirror, so a run
+    where little changed costs a request or two, not a full download.
 
 bin/abridge runs this with the apple-bridge venv's python, which has pyicloud.
 """
@@ -15,16 +17,26 @@ bin/abridge runs this with the apple-bridge venv's python, which has pyicloud.
 from __future__ import annotations
 
 import argparse
+import base64
+import gzip
 import json
 import os
 import re
+import subprocess
 import sys
+import time
+import uuid
+import zlib
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from types import SimpleNamespace
+from typing import Any, Callable, Iterable
 
 PRIORITIES = {"none": 0, "high": 1, "medium": 5, "low": 9}
 MIRROR_MARKER = ".abridge-mirror"
+MIRROR_STATE = ".abridge-sync.json"  # in the mirror; todoman's `dir/*` glob skips it
+FULL_REFRESH = 24 * 3600  # seconds between full fetches, in case a token ever misses something
+LIST_FIELDS = ("id", "title", "color", "count", "deleted", "is_group")
 REMINDER_PREFIX = "Reminder/"
 LIST_PREFIX = "List/"
 FULL_ID = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}")
@@ -84,7 +96,9 @@ def resolve_reminder(reminders: Iterable[Any], query: str) -> Any:
 def local_tz_name() -> str | None:
     """The IANA name of the system time zone, e.g. 'Asia/Kolkata'."""
     tz = os.environ.get("TZ", "").lstrip(":")
-    if "/" in tz and not tz.startswith("/"):
+    # Any zone name the system knows ("Asia/Kolkata", "UTC"): times were
+    # computed in it, so it has to be the label too.
+    if tz and not tz.startswith("/") and ("/" in tz or (Path("/usr/share/zoneinfo") / tz).is_file()):
         return tz
     try:
         target = os.readlink("/etc/localtime")
@@ -243,55 +257,118 @@ def write_if_changed(path: Path, content: str) -> bool:
             return False
     except FileNotFoundError:
         pass
-    tmp = path.with_name(f".{path.name}.tmp")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")  # unique: the app and the timer can overlap
     tmp.write_bytes(data)
     os.replace(tmp, path)
     return True
 
 
-def mirror(snapshot: list[tuple[Any, list[Any]]], dest: Path) -> dict[str, int]:
-    """Make `dest` an exact copy of `snapshot`, a list of (list, reminders).
+def read_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return None
 
-    One collection directory per list, named by list id so a rename on the
-    phone doesn't move files around, with vdir `displayname` and `color`
-    metadata. Only directories this tool created are ever deleted.
+
+def collections(lists: list[Any], dest: Path) -> dict[str, tuple[Any, Path, bool]]:
+    """Give each list its collection directory, and delete those of lists that
+    are gone. Returns {bare list id: (list, directory, renamed)}; `renamed` is
+    also true for a directory that is new, since either way its files need
+    rewriting (every VTODO carries the list name).
+
+    Directories are named by list id so a rename on the phone doesn't move
+    files around. Only directories this tool created are ever deleted.
     """
     if dest.exists() and any(dest.iterdir()) and not (dest / MIRROR_MARKER).exists():
         raise UserError(f"{dest} is not empty and is not an apple-bridge mirror; refusing to write there")
     dest.mkdir(parents=True, exist_ok=True)
     (dest / MIRROR_MARKER).touch()
 
-    stats = {"lists": 0, "written": 0, "removed": 0, "unchanged": 0}
-    keep_dirs = set()
-    for reminder_list, reminders in snapshot:
+    out = {}
+    for reminder_list in lists:
         coll = dest / bare_id(reminder_list.id)
-        keep_dirs.add(coll.name)
         coll.mkdir(exist_ok=True)
         (coll / MIRROR_MARKER).touch()
-        write_if_changed(coll / "displayname", reminder_list.title)
+        renamed = write_if_changed(coll / "displayname", reminder_list.title)
         color = list_color(reminder_list.color)
         if color:
             write_if_changed(coll / "color", color)
-        stats["lists"] += 1
-
-        keep_files = set()
-        for reminder in reminders:
-            name = f"{bare_id(reminder.id)}.ics"
-            keep_files.add(name)
-            if write_if_changed(coll / name, to_vtodo(reminder, reminder_list.title)):
-                stats["written"] += 1
-            else:
-                stats["unchanged"] += 1
-        for stale in coll.glob("*.ics"):
-            if stale.name not in keep_files:
-                stale.unlink()
-                stats["removed"] += 1
+        out[coll.name] = (reminder_list, coll, renamed)
 
     for coll in dest.iterdir():
-        if coll.is_dir() and coll.name not in keep_dirs and (coll / MIRROR_MARKER).exists():
+        if coll.is_dir() and coll.name not in out and (coll / MIRROR_MARKER).exists():
             for child in coll.iterdir():
                 child.unlink()
             coll.rmdir()
+    return out
+
+
+def copy_list(coll: Path, reminder_list: Any, reminders: list[Any], stats: dict[str, int]) -> None:
+    """Make `coll` hold exactly `reminders`."""
+    keep_files = set()
+    for reminder in reminders:
+        name = f"{bare_id(reminder.id)}.ics"
+        keep_files.add(name)
+        if write_if_changed(coll / name, to_vtodo(reminder, reminder_list.title)):
+            stats["written"] += 1
+        else:
+            stats["unchanged"] += 1
+    for stale in coll.glob("*.ics"):
+        if stale.name not in keep_files:
+            stale.unlink()
+            stats["removed"] += 1
+
+
+def mirror(snapshot: list[tuple[Any, list[Any]]], dest: Path) -> dict[str, int]:
+    """Make `dest` an exact copy of `snapshot`, a list of (list, reminders).
+
+    One collection directory per list, with vdir `displayname` and `color`
+    metadata, and one .ics file per reminder.
+    """
+    colls = collections([l for l, _ in snapshot], dest)
+    stats = {"lists": len(colls), "written": 0, "removed": 0, "unchanged": 0}
+    for reminder_list, reminders in snapshot:
+        copy_list(colls[bare_id(reminder_list.id)][1], reminder_list, reminders, stats)
+    return stats
+
+
+def mirror_changes(lists: list[Any], changes: list[Any], dest: Path, fetch: Callable[[Any], list[Any]]) -> dict[str, int]:
+    """Bring a mirror made by mirror() up to date with pyicloud change events
+    (type "updated" or "deleted", reminder_id, reminder).
+
+    A list that is new here or was renamed is copied whole with
+    `fetch(list)`; every other list only gets the files that changed.
+    """
+    colls = collections(lists, dest)
+    stats = {"lists": len(colls), "written": 0, "removed": 0, "unchanged": 0}
+    whole = {lid for lid, (_, _, renamed) in colls.items() if renamed}
+    for lid in whole:
+        reminder_list, coll, _ = colls[lid]
+        copy_list(coll, reminder_list, fetch(reminder_list), stats)
+
+    written = set()
+    for change in changes:
+        r = change.reminder
+        home = None
+        if change.type == "updated" and r is not None and not r.deleted:
+            home = bare_id(r.list_id or "")
+        name = f"{bare_id(change.reminder_id)}.ics"
+        for lid, (reminder_list, coll, _) in colls.items():
+            if lid in whole:
+                continue
+            path = coll / name
+            if lid == home:
+                if write_if_changed(path, to_vtodo(r, reminder_list.title)):
+                    written.add(path)
+            elif path.exists():  # deleted, or moved to another list
+                path.unlink()
+                written.discard(path)
+                stats["removed"] += 1
+
+    stats["written"] += len(written)
+    for lid, (_, coll, _) in colls.items():
+        if lid not in whole:
+            stats["unchanged"] += sum(1 for p in coll.glob("*.ics") if p not in written)
     return stats
 
 
@@ -312,6 +389,102 @@ def connect(apple_id: str, session_dir: str) -> Any:
     if not status.get("authenticated"):
         raise UserError("not signed in to iCloud (or the session expired). Run: abridge setup reminders")
     return api.reminders
+
+
+def icloud_error(err: BaseException) -> bool:
+    """pyicloud raises its own types for auth and CloudKit failures."""
+    return type(err).__module__.startswith("pyicloud")
+
+
+def can_follow_lists(svc: Any) -> bool:
+    return hasattr(getattr(svc, "_reads", None), "_iter_zone_change_pages") and hasattr(svc, "_record_to_list")
+
+
+def list_changes(svc: Any, token: str | None) -> tuple[list[Any], set[str], str | None]:
+    """Lists added or changed since `token` (every list if None), the record
+    names of records deleted since then, and the token to continue from.
+
+    pyicloud has no public call for this: its lists() replays the zone's whole
+    change history from the start, one ~1.4 s request per page and ~20 pages
+    for a few hundred reminders. This drives the pager lists() is built on
+    (pyicloud 2.7, pinned in lib/common.sh); can_follow_lists() checks it.
+    """
+    from pyicloud.common.cloudkit import CKErrorItem, CKRecord, CKTombstoneRecord
+
+    changed: dict[str, Any] = {}
+    gone: set[str] = set()
+    for zone in svc._reads._iter_zone_change_pages(desired_record_types=["List"], sync_token=token):
+        for rec in zone.records:
+            if isinstance(rec, CKErrorItem):
+                raise UserError(f"iCloud refused to list your lists: {rec.serverErrorCode} ({rec.reason})")
+            if isinstance(rec, CKTombstoneRecord):
+                gone.add(rec.recordName)
+                changed.pop(rec.recordName, None)
+            elif isinstance(rec, CKRecord) and rec.recordType == "List":
+                reminder_list = svc._record_to_list(rec)
+                changed[reminder_list.id] = reminder_list
+                gone.discard(reminder_list.id)
+        token = zone.syncToken
+    return list(changed.values()), gone, token
+
+
+class CachedLists:
+    """pyicloud's Reminders service, with lists() served from a cache file
+    that one small changes/zone request brings up to date.
+
+    The whole list is fetched again when there's no usable cache, when iCloud
+    rejects the token, and once a day.
+    """
+
+    def __init__(self, svc: Any, cache: Path | None, apple_id: str) -> None:
+        self.svc = svc
+        self.cache = cache
+        self.apple_id = apple_id
+        self._lists: list[Any] | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.svc, name)
+
+    def lists(self) -> list[Any]:
+        if self._lists is None:
+            if self.cache is None or not can_follow_lists(self.svc):
+                self._lists = list(self.svc.lists())
+            else:
+                self._lists = [SimpleNamespace(**l) for l in self._fetch()]
+        return self._lists
+
+    def _fetch(self) -> list[dict[str, Any]]:
+        saved = read_json(self.cache)
+        if (
+            isinstance(saved, dict)
+            and saved.get("apple_id") == self.apple_id
+            and isinstance(saved.get("token"), str)
+            and isinstance(saved.get("lists"), list)
+            and time.time() - saved.get("full", 0) < FULL_REFRESH
+        ):
+            try:
+                changed, gone, token = list_changes(self.svc, saved["token"])
+            except Exception as err:  # noqa: BLE001
+                if not icloud_error(err):
+                    raise
+                # Most likely an expired token: start again from scratch.
+            else:
+                by_id = {l["id"]: l for l in saved["lists"] if l.get("id") not in gone}
+                for l in changed:
+                    by_id[l.id] = {k: getattr(l, k) for k in LIST_FIELDS}
+                return self._save(token, saved["full"], list(by_id.values()))
+        changed, _, token = list_changes(self.svc, None)
+        return self._save(token, time.time(), [{k: getattr(l, k) for k in LIST_FIELDS} for l in changed])
+
+    def _save(self, token: str | None, full: float, lists: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if token:
+            data = {"apple_id": self.apple_id, "token": token, "full": full, "lists": lists}
+            try:
+                self.cache.parent.mkdir(parents=True, exist_ok=True)
+                write_if_changed(self.cache, json.dumps(data, ensure_ascii=False))
+            except OSError:
+                pass  # the cache only saves time
+        return lists
 
 
 def live_lists(svc: Any) -> list[Any]:
@@ -373,6 +546,145 @@ def reminder_json(r: Any) -> dict[str, Any]:
         "created": iso(r.created),
         "modified": iso(r.modified),
     }
+
+
+# ------------------------------------------------------------------ writes
+
+APPLE_EPOCH = 978307200  # 2001-01-01 UTC, the epoch of ResolutionTokenMap times
+TOPOTEXT = Path(__file__).resolve().with_name("abridge-topotext.mjs")
+
+
+def token_key(field: str) -> str:
+    """ResolutionTokenMap keys are the record's field names in lowerCamelCase."""
+    return field[:1].lower() + field[1:]
+
+
+def advance_tokens(tokens: dict[str, Any], fields: Iterable[str], now: float) -> dict[str, Any]:
+    """The ResolutionTokenMap after changing `fields`: each of their counters
+    goes up by one, and every other entry stays as it was.
+
+    An entry ({counter, modificationTime, replicaID}) is how Apple's clients
+    decide which change to a field is the newest. pyicloud replaces the whole
+    map with counter 1 for each field it writes: to an iPhone that has
+    counted 238 completions of a repeating reminder, that change looks older
+    than the one it has, and the fields pyicloud doesn't know lose their
+    entries. Apple's own records have a distinct random replicaID in every
+    entry, so a new one is minted per change.
+    """
+    out = {key: dict(entry) for key, entry in tokens.items()}
+    for field in fields:
+        key = token_key(field)
+        out[key] = {
+            "counter": int(out.get(key, {}).get("counter", 0)) + 1,
+            "modificationTime": now - APPLE_EPOCH,
+            "replicaID": str(uuid.uuid4()).upper(),
+        }
+    return out
+
+
+def decompress_document(value: str | bytes) -> bytes:
+    """A TitleDocument/NotesDocument value: base64 text or bytes, gzip (the
+    iPhone) or zlib (pyicloud) compressed."""
+    data = value if isinstance(value, bytes) else base64.b64decode(value + "=" * (-len(value) % 4))
+    for decompress in (gzip.decompress, zlib.decompress):
+        try:
+            return decompress(data)
+        except (OSError, zlib.error):
+            continue
+    return data
+
+
+class Writer:
+    """Changes existing reminders the way Apple's own clients do: only the
+    fields that changed, each with its ResolutionTokenMap entry advanced, and
+    titles and notes edited as the CRDT documents they are
+    (abridge-topotext.mjs).
+
+    pyicloud's update() instead rewrites every field, restarts the token
+    counters at 1, adds an empty NotesDocument to reminders that have none,
+    and replaces the title and notes with brand-new documents under a fixed
+    replica id. New reminders still go through pyicloud's create(), whose
+    record matches the iPhone's own first save of a reminder.
+    """
+
+    def __init__(self, svc: Any, replica_file: Path | None, icloud_md: str | None) -> None:
+        self.svc = svc
+        self.replica_file = replica_file
+        self.icloud_md = icloud_md
+
+    def record(self, reminder: Any) -> Any:
+        """The reminder's current CloudKit record (fields, change tag)."""
+        from pyicloud.services.reminders._constants import _REMINDERS_ZONE_REQ
+
+        name = f"{REMINDER_PREFIX}{bare_id(reminder.id)}"
+        for rec in self.svc._raw.lookup(record_names=[name], zone_id=_REMINDERS_ZONE_REQ).records:
+            if getattr(rec, "recordName", None) == name and getattr(rec, "fields", None) is not None:
+                return rec
+        raise UserError(f'"{reminder.title}" no longer exists in iCloud')
+
+    def replica(self) -> bytes:
+        """This computer's replica id for text edits: made once, then kept, so
+        our edits continue our own clocks like any other device's."""
+        if self.replica_file is None:
+            raise UserError("no file to keep this computer's replica id in (ABRIDGE_REMINDERS_REPLICA)")
+        try:
+            value = base64.b64decode(self.replica_file.read_text().strip(), validate=True)
+            if len(value) == 16:
+                return value
+        except (OSError, ValueError):
+            pass
+        value = os.urandom(16)
+        self.replica_file.parent.mkdir(parents=True, exist_ok=True)
+        self.replica_file.write_text(base64.b64encode(value).decode() + "\n")
+        return value
+
+    def text(self, rec: Any, field: str, text: str) -> dict[str, Any] | None:
+        """The new value of TitleDocument or NotesDocument, or None when
+        there's nothing to store (no document yet, and no text)."""
+        current = rec.fields.get_value(field)
+        if not current and not text:
+            return None
+        if not self.icloud_md:
+            raise UserError("changing a reminder's title or notes needs icloud-md. Run install.sh")
+        request = {
+            "doc": base64.b64encode(decompress_document(current)).decode() if current else None,
+            "text": text,
+            "replica": base64.b64encode(self.replica()).decode(),
+        }
+        proc = subprocess.run(
+            ["node", str(TOPOTEXT), self.icloud_md], input=json.dumps(request), capture_output=True, text=True
+        )
+        if proc.returncode != 0:
+            raise UserError(f"could not edit the reminder's text: {proc.stderr.strip() or 'node failed'}")
+        doc = base64.b64decode(json.loads(proc.stdout)["doc"])
+        return {"type": "STRING", "value": base64.b64encode(gzip.compress(doc, mtime=0)).decode()}
+
+    def save(self, rec: Any, fields: dict[str, dict[str, Any]], title: str) -> None:
+        """Write `fields` (plus LastModifiedDate) to the record, if nothing
+        changed it since we read it."""
+        from pyicloud.common.cloudkit import CKErrorItem, CKModifyOperation, CKWriteRecord
+        from pyicloud.services.reminders._constants import _REMINDERS_ZONE_REQ
+
+        now = time.time()
+        fields = {**fields, "LastModifiedDate": {"type": "TIMESTAMP", "value": int(now * 1000)}}
+        current = json.loads(rec.fields.get_value("ResolutionTokenMap") or "{}")
+        tokens = {**current, "map": advance_tokens(current.get("map", {}), list(fields), now)}
+        fields["ResolutionTokenMap"] = {"type": "STRING", "value": json.dumps(tokens, separators=(",", ":"))}
+        op = CKModifyOperation(
+            operationType="update",
+            record=CKWriteRecord(
+                recordName=rec.recordName, recordType="Reminder", recordChangeTag=rec.recordChangeTag, fields=fields
+            ),
+        )
+        for item in self.svc._raw.modify(operations=[op], zone_id=_REMINDERS_ZONE_REQ).records:
+            if isinstance(item, CKErrorItem):
+                if item.serverErrorCode == "CONFLICT":
+                    raise UserError(f'"{title}" changed on another device just now; try again')
+                raise UserError(f'iCloud refused the change to "{title}": {item.serverErrorCode} ({item.reason})')
+
+
+def timestamp_ms(moment: datetime | None) -> int | None:
+    return int(aware(moment).timestamp() * 1000) if moment else None
 
 
 # ---------------------------------------------------------------- commands
@@ -452,39 +764,63 @@ def cmd_add(svc: Any, args: argparse.Namespace) -> None:
 
 def set_completed(svc: Any, args: argparse.Namespace, completed: bool) -> None:
     find = Finder(svc)
-    for query in args.ids:
-        r = find(query)
-        r.completed = completed
-        svc.update(r)
-        print(f"{'done' if completed else 'not done'}: {r.title}  ({short_id(r.id)})")
+    targets = [find(query) for query in args.ids]
+    for r in targets:
+        # The iPhone completes one occurrence and moves a repeating reminder
+        # to its next date; written from here, Completed would end the series.
+        if completed and not r.completed and getattr(r, "recurrence_rule_ids", None):
+            raise UserError(f'"{r.title}" repeats: complete it on the iPhone, which moves it to its next date')
+    for r in targets:
+        label = "done" if completed else "not done"
+        if bool(r.completed) == completed:
+            print(f"already {label}: {r.title}  ({short_id(r.id)})")
+            continue
+        fields = {
+            "Completed": {"type": "INT64", "value": 1 if completed else 0},
+            "CompletionDate": {"type": "TIMESTAMP", "value": int(time.time() * 1000) if completed else None},
+        }
+        args.writer.save(args.writer.record(r), fields, r.title)
+        print(f"{label}: {r.title}  ({short_id(r.id)})")
 
 
 def cmd_rm(svc: Any, args: argparse.Namespace) -> None:
     find = Finder(svc)
-    for query in args.ids:
-        r = find(query)
-        svc.delete(r)
+    for r in [find(query) for query in args.ids]:
+        args.writer.save(args.writer.record(r), {"Deleted": {"type": "INT64", "value": 1}}, r.title)
         print(f"deleted: {r.title}  ({short_id(r.id)})")
 
 
 def cmd_edit(svc: Any, args: argparse.Namespace) -> None:
     r = Finder(svc)(args.id)
-    if args.title is not None:
-        if not args.title.strip():
-            raise UserError("the title cannot be empty")
-        r.title = args.title
-    if args.notes is not None:
-        r.desc = args.notes
-    if args.no_due:
-        r.due_date, r.all_day, r.time_zone = None, False, None
-    elif args.due:
-        r.due_date, r.all_day, r.time_zone = parse_due(args.due)
-    if args.priority:
-        r.priority = PRIORITIES[args.priority]
-    if args.flag is not None:
-        r.flagged = args.flag
-    svc.update(r)
-    print(f"updated: {r.title}  ({short_id(r.id)})")
+    if args.title is not None and not args.title.strip():
+        raise UserError("the title cannot be empty")
+    rec = args.writer.record(r)
+    # Only what actually changes is written: the app sends every field.
+    fields: dict[str, dict[str, Any]] = {}
+    if args.title is not None and args.title != (r.title or ""):
+        fields["TitleDocument"] = args.writer.text(rec, "TitleDocument", args.title)
+    if args.notes is not None and args.notes != (r.desc or ""):
+        notes = args.writer.text(rec, "NotesDocument", args.notes)
+        if notes:
+            fields["NotesDocument"] = notes
+    if args.no_due or args.due:
+        due, all_day, tz_name = (None, False, None) if args.no_due else parse_due(args.due)
+        if timestamp_ms(due) != timestamp_ms(r.due_date):
+            fields["DueDate"] = {"type": "TIMESTAMP", "value": timestamp_ms(due)}
+        if all_day != bool(r.all_day):
+            fields["AllDay"] = {"type": "INT64", "value": 1 if all_day else 0}
+        if tz_name != (r.time_zone or None):
+            fields["TimeZone"] = {"type": "STRING", "value": tz_name}
+    if args.priority and PRIORITIES[args.priority] != (r.priority or 0):
+        fields["Priority"] = {"type": "INT64", "value": PRIORITIES[args.priority]}
+    if args.flag is not None and args.flag != bool(r.flagged):
+        fields["Flagged"] = {"type": "INT64", "value": 1 if args.flag else 0}
+    title = args.title if "TitleDocument" in fields else r.title
+    if not fields:
+        print(f"unchanged: {title}  ({short_id(r.id)})")
+        return
+    args.writer.save(rec, fields, r.title)
+    print(f"updated: {title}  ({short_id(r.id)})")
 
 
 def cmd_dump(svc: Any, args: argparse.Namespace) -> None:
@@ -505,8 +841,32 @@ def cmd_dump(svc: Any, args: argparse.Namespace) -> None:
 
 
 def cmd_mirror(svc: Any, args: argparse.Namespace) -> None:
-    snapshot = [(l, reminders_in(svc, l, True)) for l in live_lists(svc)]
-    stats = mirror(snapshot, Path(args.dest).expanduser())
+    dest = Path(args.dest).expanduser()
+    lists = live_lists(svc)
+    saved = read_json(dest / MIRROR_STATE)
+    # Take the token first: anything that changes while we read is then
+    # fetched again next time, rather than missed.
+    token = svc.sync_cursor()
+    stats = None
+    if (
+        isinstance(saved, dict)
+        and saved.get("apple_id") == args.apple_id
+        and isinstance(saved.get("token"), str)
+        and time.time() - saved.get("full", 0) < FULL_REFRESH
+        and (dest / MIRROR_MARKER).exists()
+    ):
+        try:
+            changes = list(svc.iter_changes(since=saved["token"]))
+        except Exception as err:  # noqa: BLE001
+            if not icloud_error(err):
+                raise
+        else:
+            stats = mirror_changes(lists, changes, dest, lambda l: reminders_in(svc, l, True))
+            full = saved["full"]
+    if stats is None:
+        stats = mirror([(l, reminders_in(svc, l, True)) for l in lists], dest)
+        full = time.time()
+    write_if_changed(dest / MIRROR_STATE, json.dumps({"apple_id": args.apple_id, "token": token, "full": full}))
     print(
         f"reminders mirror: {stats['lists']} lists, {stats['written']} written, "
         f"{stats['unchanged']} unchanged, {stats['removed']} removed -> {args.dest}"
@@ -517,6 +877,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="abridge rem", description=__doc__.split("\n\n")[0])
     p.add_argument("--apple-id", default=os.environ.get("APPLE_ID"))
     p.add_argument("--session-dir", default=os.environ.get("ABRIDGE_PYICLOUD_SESSION"))
+    p.add_argument("--cache", default=os.environ.get("ABRIDGE_REMINDERS_CACHE"), help="file to cache your lists in")
+    p.add_argument(
+        "--replica-file", default=os.environ.get("ABRIDGE_REMINDERS_REPLICA"), help="file keeping this computer's replica id"
+    )
     sub = p.add_subparsers(dest="command", required=True)
 
     sub.add_parser("lists", help="show your lists").set_defaults(func=cmd_lists)
@@ -578,14 +942,18 @@ def main(argv: list[str] | None = None) -> int:
             raise UserError("no pyicloud session directory given")
         if args.command == "mirror" and not args.dest:
             raise UserError("no destination for the mirror (REMINDERS_DIR)")
-        args.func(connect(args.apple_id, args.session_dir), args)
+        svc = connect(args.apple_id, args.session_dir)
+        cache = Path(args.cache).expanduser() if args.cache else None
+        replica = Path(args.replica_file).expanduser() if args.replica_file else None
+        args.writer = Writer(svc, replica, os.environ.get("ABRIDGE_ICLOUD_MD_PKG"))
+        args.func(CachedLists(svc, cache, args.apple_id), args)
     except UserError as err:
         print(f"error: {err}", file=sys.stderr)
         return 1
     except Exception as err:  # noqa: BLE001
-        # pyicloud raises its own types for auth and CloudKit failures; show
-        # them as one line. Anything else is a bug here: keep the traceback.
-        if not type(err).__module__.startswith("pyicloud"):
+        # Show iCloud failures as one line. Anything else is a bug here: keep
+        # the traceback.
+        if not icloud_error(err):
             raise
         print(f"iCloud error: {err}", file=sys.stderr)
         return 2

@@ -324,7 +324,8 @@ reminders_helper() {
   [ -x "$ABRIDGE_VENV/bin/python" ] || die "pyicloud is not installed. Run install.sh"
   require_apple_id
   APPLE_ID="$APPLE_ID" ABRIDGE_PYICLOUD_SESSION="$ABRIDGE_PYICLOUD_SESSION" \
-    REMINDERS_DIR="$REMINDERS_DIR" \
+    ABRIDGE_REMINDERS_CACHE="$ABRIDGE_STATE_DIR/reminders-lists.json" REMINDERS_DIR="$REMINDERS_DIR" \
+    ABRIDGE_REMINDERS_REPLICA="$ABRIDGE_STATE_DIR/reminders-replica" ABRIDGE_ICLOUD_MD_PKG="$ABRIDGE_ICLOUD_MD_PKG" \
     "$ABRIDGE_VENV/bin/python" "$ABRIDGE_ROOT/libexec/abridge-reminders" "$@"
 }
 
@@ -437,6 +438,8 @@ _notes_pull() {
 
 notes_push() {
   notes_ready || die "notes are not set up. Run: abridge setup notes"
+  icloud_md_patched \
+    || die "icloud-md is missing apple-bridge's fix for notes that freeze the iPhone. Run install.sh, then push again"
   with_lock notes _notes_push "$@"
 }
 
@@ -808,7 +811,13 @@ cmd_doctor() {
     if have "$t"; then ok "$t"; else warn "$t missing"; fi
   done
   if [ -x "$ICLOUD_BIN" ]; then ok "pyicloud $("$ICLOUD_BIN" --version 2>/dev/null | tr -d '\n')"; else warn "pyicloud missing"; fi
-  if [ -x "$ICLOUD_MD_BIN" ]; then ok "icloud-md $("$ICLOUD_MD_BIN" --version 2>/dev/null | tr -d '\n')"; else warn "icloud-md missing"; fi
+  if [ ! -x "$ICLOUD_MD_BIN" ]; then
+    warn "icloud-md missing"
+  elif icloud_md_patched; then
+    ok "icloud-md $("$ICLOUD_MD_BIN" --version 2>/dev/null | tr -d '\n') (with apple-bridge's paragraph fix)"
+  else
+    warn "icloud-md $("$ICLOUD_MD_BIN" --version 2>/dev/null | tr -d '\n') without apple-bridge's paragraph fix: notes push is disabled. Run install.sh"
+  fi
   if have localsend_app || have localsend || flatpak info org.localsend.localsend_app >/dev/null 2>&1; then
     ok "LocalSend"
   else

@@ -75,9 +75,48 @@ become UTC. Subtasks become `RELATED-TO;RELTYPE=PARENT`. The list name and
 changes. The mirror deletes only folders that carry its `.abridge-mirror`
 marker.
 
-Two-way sync through the mirror was left out on purpose. Writing back means
-merging CRDT text and matching change tags, which pyicloud already handles
-for single records. `abridge rem add/done/rm` uses exactly that path.
+Both the mirror and the list of lists follow `changes/zone` sync tokens
+rather than fetching everything each time. Fetching everything is slow:
+pyicloud's `lists()` replays the zone's whole change history, one ~1.4 s
+request per mostly empty page (about 20 pages for 700 reminders), and a full
+mirror downloads every completed reminder again (7 MB for 700). The lists
+and their token are cached in `~/.local/state/apple-bridge/reminders-lists.json`,
+so every `abridge rem` command starts with one small request. The mirror
+keeps its token in `reminders/.abridge-sync.json` and applies only the
+reminders that changed. A list that is new or renamed is copied whole,
+because every file names its list. Both fetch everything again when
+iCloud rejects the token, and once a day in case a token ever misses
+something.
+
+Two-way sync through the mirror was left out on purpose. `abridge rem`
+writes one record at a time instead, the way Apple's own clients do.
+pyicloud's `update()` and `delete()` don't, and the iPhone noticed:
+
+- **Only the fields that changed** are sent, with the record's change tag,
+  so a reminder edited elsewhere in the meantime is refused (`CONFLICT`)
+  rather than overwritten. pyicloud rewrites every field, and adds an
+  empty `NotesDocument` to reminders that have none.
+- **`ResolutionTokenMap`** holds one `{counter, modificationTime,
+  replicaID}` entry per field; Apple's clients use it to decide which
+  change to a field is newest. A write advances the entries of the fields
+  it changes (counter + 1, a fresh random `replicaID` as in Apple's own
+  records) and keeps the rest. pyicloud replaces the map with counter 1
+  for the fields it writes, so to a phone that had counted 238 completions
+  of a repeating reminder the change looked older than its own.
+- **Titles and notes** are topotext CRDT documents, the same format as a
+  note's body. pyicloud writes a brand-new document every time, under one
+  fixed replica id with clocks restarting at 0, so a second edit reuses
+  character ids the phone already has for other text. abridge edits the
+  existing document with icloud-md's editor
+  (`libexec/abridge-topotext.mjs`), under a replica id of its own kept in
+  `~/.local/state/apple-bridge/reminders-replica`. All 732 title and notes
+  documents of a real account round-trip through it byte for byte.
+- **Repeating reminders** can't be completed from Linux: the phone
+  completes one occurrence and moves the reminder to its next date, which
+  needs its recurrence rules. Setting `Completed` would end the series.
+- New reminders still go through pyicloud's `create()`, whose record
+  matches the iPhone's own first save (every counter 1, a fresh title
+  document).
 
 ## Notes: CloudKit again, as Markdown
 
@@ -102,6 +141,20 @@ service and the same operations as Reminders.
 abridge wraps every `pull` and `push` in git commits, and checks
 `verify-auth` before a background pull. Otherwise an expired session would
 try to open a sign-in window that no one can see.
+
+**Paragraph styles have to be uniform.** Note text carries one attribute run
+per stretch of characters, and Apple's text system takes a paragraph's style
+from its first character. icloud-md 0.6.2 reads it from the paragraph's
+newline, and text a push inserts at a paragraph boundary inherits the
+neighbouring paragraph's run. So typing at the start of a checklist item, or
+retyping a line next to a table, could upload a paragraph whose characters
+say Body with one checklist id while its newline says Checklist with another.
+icloud-md's verification accepted it, and Notes on the iPhone hung on it.
+`share/patches/icloud-md-0.6.2.patch`, applied by `install.sh`, makes the
+reconciler rewrite such paragraphs uniformly and makes `push` refuse any that
+remain. `abridge notes push` refuses to run without it. Apple's own notes
+do mix an explicit `0` with an unset field, which reads as the same value, so
+the check compares effective values.
 
 **Offline fallback (ADP on, or no web access):** an iPhone backup over USB
 (`abridge usb encrypt`, then `abridge usb backup DIR`) contains
@@ -186,10 +239,16 @@ keeps their syncs from overlapping.
 - **Notes** reads and writes the icloud-md vault directly. The editor
   (TipTap) only offers formatting icloud-md can map back to Apple Notes, and
   the frontmatter that carries each note's identity is split off and
-  re-attached byte for byte with icloud-md's own rules. A note is written
-  only when its Markdown really differs from what was loaded. A write is
-  refused if a pull changed the file in the meantime. Edits are pushed
-  4 seconds after you stop typing.
+  re-attached byte for byte with icloud-md's own rules. icloud-md's
+  Markdown has one line per Apple paragraph (an empty line is an empty
+  paragraph, consecutive lines are separate paragraphs), which CommonMark
+  would merge, so notes cross into the editor and back through
+  `ui/notes/lines.js`. A save then changes only the lines that were edited
+  (`ui/notes/merge.js`): the editor's own way of writing tables, spacing
+  and escapes never reaches the file, provided the merged text reads back
+  exactly as the editor shows it. A note is written only when it really
+  changed, and a write is refused if a pull changed the file in the
+  meantime. Edits are pushed 4 seconds after you stop typing.
 - **Calendar** reads and writes vdirsyncer's `.ics` files with ical.js,
   then runs `abridge sync calendar`. Edits keep every property they don't
   show (attendees, Apple's `X-` properties), keep an event's time zone when
