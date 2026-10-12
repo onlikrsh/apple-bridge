@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+"""Apple Reminders from the Linux command line, on top of pyicloud.
+
+Upgraded iCloud Reminders (iOS 13 and later) live in a private CloudKit
+database, not CalDAV, so no Linux calendar or task app can see them. This
+talks to that database through pyicloud and adds:
+
+  * name-based list selection and short ids, so you never paste a UUID;
+  * a one-way mirror of every reminder into a vdir of VTODO .ics files, which
+    todoman (and anything else that reads vdirs) can display offline.
+
+bin/abridge runs this with the apple-bridge venv's python, which has pyicloud.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+PRIORITIES = {"none": 0, "high": 1, "medium": 5, "low": 9}
+MIRROR_MARKER = ".abridge-mirror"
+REMINDER_PREFIX = "Reminder/"
+LIST_PREFIX = "List/"
+
+
+class UserError(Exception):
+    """A problem the user can fix; printed without a traceback."""
+
+
+# --------------------------------------------------------------------- ids
+
+
+def bare_id(record_id: str) -> str:
+    """'Reminder/ABC-123' -> 'ABC-123'."""
+    return record_id.split("/", 1)[1] if "/" in record_id else record_id
+
+
+def short_id(record_id: str) -> str:
+    return bare_id(record_id)[:8]
+
+
+def resolve_list(lists: Iterable[Any], query: str) -> Any:
+    """Pick a list by exact title, then title prefix, then id (all case-insensitive)."""
+    lists = list(lists)
+    q = query.casefold()
+    for match in (
+        lambda l: l.title.casefold() == q,
+        lambda l: l.title.casefold().startswith(q),
+        lambda l: bare_id(l.id).casefold().startswith(q),
+    ):
+        hits = [l for l in lists if match(l)]
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            names = ", ".join(sorted(l.title for l in hits))
+            raise UserError(f'"{query}" matches several lists: {names}')
+    names = ", ".join(sorted(l.title for l in lists)) or "(none)"
+    raise UserError(f'no list matches "{query}". Lists: {names}')
+
+
+def resolve_reminder(reminders: Iterable[Any], query: str) -> Any:
+    """Pick a reminder by full id or by a prefix of its bare id."""
+    q = bare_id(query.strip()).casefold()
+    if not q:
+        raise UserError("empty reminder id")
+    hits = [r for r in reminders if bare_id(r.id).casefold().startswith(q)]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        raise UserError(f"no reminder has an id starting with {query}")
+    raise UserError(f"{query} is ambiguous ({len(hits)} reminders); use more characters")
+
+
+# ------------------------------------------------------------------- dates
+
+
+def local_tz_name() -> str | None:
+    """The IANA name of the system time zone, e.g. 'Asia/Kolkata'."""
+    tz = os.environ.get("TZ", "").lstrip(":")
+    if "/" in tz and not tz.startswith("/"):
+        return tz
+    try:
+        target = os.readlink("/etc/localtime")
+    except OSError:
+        return None
+    marker = "zoneinfo/"
+    return target.split(marker, 1)[1] if marker in target else None
+
+
+def parse_due(text: str, today: date | None = None) -> tuple[datetime, bool, str | None]:
+    """Parse a --due value into (utc datetime, all_day, time zone name).
+
+    Matches how Apple stores due dates in CloudKit: an all-day reminder is
+    00:00 UTC on the literal date with no time zone, a timed one is a real
+    instant plus the IANA zone it was set in.
+    """
+    today = today or date.today()
+    value = text.strip()
+    relative = {"today": 0, "tomorrow": 1}
+    if value.lower() in relative:
+        d = today + timedelta(days=relative[value.lower()])
+        return datetime(d.year, d.month, d.day, tzinfo=timezone.utc), True, None
+    try:
+        if len(value) == 10:
+            d = date.fromisoformat(value)
+            return datetime(d.year, d.month, d.day, tzinfo=timezone.utc), True, None
+        moment = datetime.fromisoformat(value.replace(" ", "T", 1))
+    except ValueError as err:
+        raise UserError(
+            f'cannot read due date "{text}"; use YYYY-MM-DD, "YYYY-MM-DD HH:MM", today or tomorrow'
+        ) from err
+    if moment.tzinfo is None:
+        moment = moment.astimezone()  # naive means local wall-clock time
+    return moment.astimezone(timezone.utc), False, local_tz_name()
+
+
+def aware(moment: datetime) -> datetime:
+    """pyicloud returns UTC-aware datetimes; treat any naive one as UTC too."""
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
+def due_label(reminder: Any) -> str:
+    if reminder.due_date is None:
+        return ""
+    due = aware(reminder.due_date)
+    if reminder.all_day:
+        return due.astimezone(timezone.utc).date().isoformat()
+    return due.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+# ------------------------------------------------------------------ VTODO
+
+
+def ical_escape(text: str) -> str:
+    return (
+        text.replace("\\", "\\\\")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+        .replace("\r\n", "\\n")
+        .replace("\n", "\\n")
+        .replace("\r", "\\n")
+    )
+
+
+def fold(line: str) -> str:
+    """Fold a content line at 75 octets (RFC 5545 3.1) without splitting UTF-8."""
+    out, current, size = [], "", 0
+    for ch in line:
+        width = len(ch.encode("utf-8"))
+        if size + width > 75:
+            out.append(current)
+            current, size = " ", 1
+        current += ch
+        size += width
+    out.append(current)
+    return "\r\n".join(out)
+
+
+def ical_utc(moment: datetime) -> str:
+    return aware(moment).astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def ical_due(name: str, moment: datetime, all_day: bool) -> str:
+    if all_day:
+        return f"{name};VALUE=DATE:{aware(moment).astimezone(timezone.utc).strftime('%Y%m%d')}"
+    return f"{name}:{ical_utc(moment)}"
+
+
+def to_vtodo(reminder: Any, list_title: str) -> str:
+    """Render one reminder as a complete VCALENDAR object."""
+    stamp = reminder.modified or reminder.created or datetime(1970, 1, 1, tzinfo=timezone.utc)
+    props = [
+        f"UID:{bare_id(reminder.id)}",
+        f"DTSTAMP:{ical_utc(stamp)}",
+        f"SUMMARY:{ical_escape(reminder.title or '')}",
+    ]
+    if reminder.desc:
+        props.append(f"DESCRIPTION:{ical_escape(reminder.desc)}")
+    if reminder.start_date:
+        props.append(ical_due("DTSTART", reminder.start_date, reminder.all_day))
+    if reminder.due_date:
+        props.append(ical_due("DUE", reminder.due_date, reminder.all_day))
+    if reminder.completed:
+        props.append("STATUS:COMPLETED")
+        if reminder.completed_date:
+            props.append(f"COMPLETED:{ical_utc(reminder.completed_date)}")
+    else:
+        props.append("STATUS:NEEDS-ACTION")
+    # Apple and RFC 5545 agree: 1 is highest, 5 medium, 9 lowest, 0 undefined.
+    if reminder.priority:
+        props.append(f"PRIORITY:{reminder.priority}")
+    categories = [list_title] + (["Flagged"] if reminder.flagged else [])
+    props.append("CATEGORIES:" + ",".join(ical_escape(c) for c in categories))
+    if reminder.parent_reminder_id:
+        props.append(f"RELATED-TO;RELTYPE=PARENT:{bare_id(reminder.parent_reminder_id)}")
+    if reminder.created:
+        props.append(f"CREATED:{ical_utc(reminder.created)}")
+    if reminder.modified:
+        props.append(f"LAST-MODIFIED:{ical_utc(reminder.modified)}")
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//apple-bridge//Reminders mirror//EN",
+        "BEGIN:VTODO",
+        *props,
+        "END:VTODO",
+        "END:VCALENDAR",
+    ]
+    return "\r\n".join(fold(line) for line in lines) + "\r\n"
+
+
+def list_color(raw: str | None) -> str | None:
+    """Reminders stores colours as JSON like {"daHexString": "#1BADF8", ...}."""
+    if not raw:
+        return None
+    raw = raw.strip()
+    if raw.startswith("#") and len(raw) in (7, 9):
+        return raw
+    if raw.startswith("{"):
+        import json
+
+        try:
+            value = json.loads(raw).get("daHexString")
+        except (ValueError, AttributeError):
+            return None
+        if isinstance(value, str) and value.startswith("#"):
+            return value
+    return None
+
+
+# ------------------------------------------------------------------ mirror
+
+
+def write_if_changed(path: Path, content: str) -> bool:
+    data = content.encode("utf-8")
+    try:
+        if path.read_bytes() == data:
+            return False
+    except FileNotFoundError:
+        pass
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+    return True
+
+
+def mirror(snapshot: list[tuple[Any, list[Any]]], dest: Path) -> dict[str, int]:
+    """Make `dest` an exact copy of `snapshot`, a list of (list, reminders).
+
+    One collection directory per list, named by list id so a rename on the
+    phone doesn't move files around, with vdir `displayname` and `color`
+    metadata. Only directories this tool created are ever deleted.
+    """
+    if dest.exists() and any(dest.iterdir()) and not (dest / MIRROR_MARKER).exists():
+        raise UserError(f"{dest} is not empty and is not an apple-bridge mirror; refusing to write there")
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / MIRROR_MARKER).touch()
+
+    stats = {"lists": 0, "written": 0, "removed": 0, "unchanged": 0}
+    keep_dirs = set()
+    for reminder_list, reminders in snapshot:
+        coll = dest / bare_id(reminder_list.id)
+        keep_dirs.add(coll.name)
+        coll.mkdir(exist_ok=True)
+        (coll / MIRROR_MARKER).touch()
+        write_if_changed(coll / "displayname", reminder_list.title)
+        color = list_color(reminder_list.color)
+        if color:
+            write_if_changed(coll / "color", color)
+        stats["lists"] += 1
+
+        keep_files = set()
+        for reminder in reminders:
+            name = f"{bare_id(reminder.id)}.ics"
+            keep_files.add(name)
+            if write_if_changed(coll / name, to_vtodo(reminder, reminder_list.title)):
+                stats["written"] += 1
+            else:
+                stats["unchanged"] += 1
+        for stale in coll.glob("*.ics"):
+            if stale.name not in keep_files:
+                stale.unlink()
+                stats["removed"] += 1
+
+    for coll in dest.iterdir():
+        if coll.is_dir() and coll.name not in keep_dirs and (coll / MIRROR_MARKER).exists():
+            for child in coll.iterdir():
+                child.unlink()
+            coll.rmdir()
+    return stats
+
+
+# ----------------------------------------------------------------- service
+
+
+def connect(apple_id: str, session_dir: str) -> Any:
+    """Return pyicloud's Reminders service using the saved session only.
+
+    Never prompts: if the session has expired, say how to renew it.
+    """
+    try:
+        from pyicloud import PyiCloudService
+    except ImportError as err:
+        raise UserError("pyicloud is not installed; run install.sh") from err
+    api = PyiCloudService(apple_id, cookie_directory=session_dir, authenticate=False)
+    status = api.get_auth_status()
+    if not status.get("authenticated"):
+        raise UserError("not signed in to iCloud (or the session expired). Run: abridge setup reminders")
+    return api.reminders
+
+
+def live_lists(svc: Any) -> list[Any]:
+    return [l for l in svc.lists() if not l.deleted and not l.is_group]
+
+
+def reminders_in(svc: Any, reminder_list: Any, include_completed: bool) -> list[Any]:
+    # results_limit is a page size; pyicloud follows continuation markers.
+    result = svc.list_reminders(
+        list_id=reminder_list.id, include_completed=include_completed, results_limit=200
+    )
+    return [r for r in result.reminders if not r.deleted]
+
+
+def all_reminders(svc: Any, include_completed: bool) -> list[Any]:
+    return [r for l in live_lists(svc) for r in reminders_in(svc, l, include_completed)]
+
+
+# ---------------------------------------------------------------- commands
+
+
+def print_reminder(r: Any) -> None:
+    box = "[x]" if r.completed else "[ ]"
+    marks = ""
+    if r.priority == 1:
+        marks += " !!!"
+    elif r.priority == 5:
+        marks += " !!"
+    elif r.priority == 9:
+        marks += " !"
+    if r.flagged:
+        marks += " (flagged)"
+    due = due_label(r)
+    due = f"  due {due}" if due else ""
+    indent = "    " if r.parent_reminder_id else "  "
+    print(f"{indent}{box} {r.title}{marks}{due}  ({short_id(r.id)})")
+
+
+def cmd_lists(svc: Any, args: argparse.Namespace) -> None:
+    for l in live_lists(svc):
+        print(f"{l.title}  ({l.count} open)")
+
+
+def cmd_ls(svc: Any, args: argparse.Namespace) -> None:
+    lists = live_lists(svc)
+    if args.list:
+        lists = [resolve_list(lists, args.list)]
+    for l in lists:
+        rows = reminders_in(svc, l, args.all)
+        if not rows and not args.list:
+            continue
+        print(f"{l.title}")
+        # Subtasks directly under their parent; everything else by due date.
+        top = [r for r in rows if not r.parent_reminder_id]
+        children: dict[str, list[Any]] = {}
+        for r in rows:
+            if r.parent_reminder_id:
+                children.setdefault(r.parent_reminder_id, []).append(r)
+        far = datetime.max.replace(tzinfo=timezone.utc)
+        top.sort(key=lambda r: (r.completed, aware(r.due_date) if r.due_date else far, (r.title or "").casefold()))
+        placed = set()
+        for r in top:
+            print_reminder(r)
+            for c in children.get(r.id, []):
+                print_reminder(c)
+                placed.add(c.id)
+        for r in rows:
+            if r.parent_reminder_id and r.id not in placed:
+                print_reminder(r)  # parent filtered out (e.g. completed)
+
+
+def cmd_add(svc: Any, args: argparse.Namespace) -> None:
+    target = resolve_list(live_lists(svc), args.list)
+    due, all_day, tz_name = (None, False, None)
+    if args.due:
+        due, all_day, tz_name = parse_due(args.due)
+    parent = None
+    if args.parent:
+        parent = resolve_reminder(reminders_in(svc, target, True), args.parent).id
+    created = svc.create(
+        list_id=target.id,
+        title=args.title,
+        desc=args.notes or "",
+        due_date=due,
+        priority=PRIORITIES[args.priority],
+        flagged=args.flag,
+        all_day=all_day,
+        time_zone=tz_name,
+        parent_reminder_id=parent,
+    )
+    print(f"added to {target.title}: {created.title}  ({short_id(created.id)})")
+
+
+def set_completed(svc: Any, args: argparse.Namespace, completed: bool) -> None:
+    pool = all_reminders(svc, include_completed=True)
+    for query in args.ids:
+        r = resolve_reminder(pool, query)
+        r.completed = completed
+        svc.update(r)
+        print(f"{'done' if completed else 'not done'}: {r.title}  ({short_id(r.id)})")
+
+
+def cmd_rm(svc: Any, args: argparse.Namespace) -> None:
+    pool = all_reminders(svc, include_completed=True)
+    for query in args.ids:
+        r = resolve_reminder(pool, query)
+        svc.delete(r)
+        print(f"deleted: {r.title}  ({short_id(r.id)})")
+
+
+def cmd_mirror(svc: Any, args: argparse.Namespace) -> None:
+    snapshot = [(l, reminders_in(svc, l, True)) for l in live_lists(svc)]
+    stats = mirror(snapshot, Path(args.dest).expanduser())
+    print(
+        f"reminders mirror: {stats['lists']} lists, {stats['written']} written, "
+        f"{stats['unchanged']} unchanged, {stats['removed']} removed -> {args.dest}"
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="abridge rem", description=__doc__.split("\n\n")[0])
+    p.add_argument("--apple-id", default=os.environ.get("APPLE_ID"))
+    p.add_argument("--session-dir", default=os.environ.get("ABRIDGE_PYICLOUD_SESSION"))
+    sub = p.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("lists", help="show your lists").set_defaults(func=cmd_lists)
+
+    ls = sub.add_parser("ls", help="show reminders, grouped by list")
+    ls.add_argument("list", nargs="?", help="list name (or the start of it)")
+    ls.add_argument("-a", "--all", action="store_true", help="include completed")
+    ls.set_defaults(func=cmd_ls)
+
+    add = sub.add_parser("add", help="add a reminder")
+    add.add_argument("list", help="list name (or the start of it)")
+    add.add_argument("title")
+    add.add_argument("-d", "--due", help='YYYY-MM-DD, "YYYY-MM-DD HH:MM", today, tomorrow')
+    add.add_argument("-n", "--notes")
+    add.add_argument("-p", "--priority", choices=list(PRIORITIES), default="none")
+    add.add_argument("-f", "--flag", action="store_true")
+    add.add_argument("--parent", help="id of the reminder to nest this under")
+    add.set_defaults(func=cmd_add)
+
+    done = sub.add_parser("done", help="mark reminders completed")
+    done.add_argument("ids", nargs="+", metavar="ID")
+    done.set_defaults(func=lambda s, a: set_completed(s, a, True))
+
+    undo = sub.add_parser("undo", help="mark reminders not completed")
+    undo.add_argument("ids", nargs="+", metavar="ID")
+    undo.set_defaults(func=lambda s, a: set_completed(s, a, False))
+
+    rm = sub.add_parser("rm", help="delete reminders (they go to Recently Deleted)")
+    rm.add_argument("ids", nargs="+", metavar="ID")
+    rm.set_defaults(func=cmd_rm)
+
+    mir = sub.add_parser("mirror", help="write every reminder to a vdir of .ics files")
+    mir.add_argument("dest", nargs="?", default=os.environ.get("REMINDERS_DIR"))
+    mir.set_defaults(func=cmd_mirror)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        if not args.apple_id:
+            raise UserError("APPLE_ID is not set. Run: abridge init")
+        if not args.session_dir:
+            raise UserError("no pyicloud session directory given")
+        if args.command == "mirror" and not args.dest:
+            raise UserError("no destination for the mirror (REMINDERS_DIR)")
+        args.func(connect(args.apple_id, args.session_dir), args)
+    except UserError as err:
+        print(f"error: {err}", file=sys.stderr)
+        return 1
+    except Exception as err:  # noqa: BLE001
+        # pyicloud raises its own types for auth and CloudKit failures; show
+        # them as one line. Anything else is a bug here: keep the traceback.
+        if not type(err).__module__.startswith("pyicloud"):
+            raise
+        print(f"iCloud error: {err}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

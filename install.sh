@@ -1,0 +1,142 @@
+#!/bin/bash
+# Install apple-bridge on Arch Linux. Safe to run again, and do so after every
+# `git pull`: the venv, the npm install and the pinned versions are copies.
+#
+#   ./install.sh                         everything except AirDrop
+#   ./install.sh --only calendar,notes   just those parts
+#   ./install.sh --yes                   no questions (pacman --noconfirm too)
+#
+# Parts: calendar (+contacts), reminders, notes, usb, localsend.
+# AirDrop needs particular Wi-Fi hardware and its own sudo rule, so it is a
+# separate step: `abridge airdrop check`, then `abridge airdrop install`.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+# shellcheck source=lib/common.sh
+. "$REPO/lib/common.sh"
+
+ALL_PARTS="calendar reminders notes usb localsend"
+PARTS="$ALL_PARTS"
+USE_PACMAN=1
+
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --only) PARTS="${2:?--only needs a list}"; PARTS="${PARTS//,/ }"; shift 2 ;;
+    --yes|-y) export ABRIDGE_YES=1; shift ;;
+    --no-pacman) USE_PACMAN=0; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
+for p in $PARTS; do
+  case " $ALL_PARTS " in *" $p "*) ;; *) die "unknown part: $p (choose from: $ALL_PARTS)" ;; esac
+done
+want() { case " $PARTS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
+[ "$(id -u)" != 0 ] || die "run this as your normal user; it uses sudo only for pacman"
+
+# ---------------------------------------------------------------- packages
+
+packages=(git python libsecret)
+want calendar && packages+=(vdirsyncer khal khard)
+want reminders && packages+=(todoman)
+want notes && packages+=(nodejs npm chromium)
+want usb && packages+=(libimobiledevice usbmuxd ifuse rsync libheif)
+
+step "System packages"
+if [ "$USE_PACMAN" = 1 ] && have pacman; then
+  # Check each name against the sync database first, so one renamed package
+  # is reported by name instead of failing the whole transaction.
+  available=() missing=()
+  for pkg in "${packages[@]}"; do
+    if pacman -Si "$pkg" >/dev/null 2>&1; then available+=("$pkg"); else missing+=("$pkg"); fi
+  done
+  [ "${#missing[@]}" = 0 ] || warn "not in your repos (try the AUR): ${missing[*]}"
+  flags=(--needed)
+  [ "${ABRIDGE_YES:-0}" = 1 ] && flags+=(--noconfirm)
+  sudo pacman -S "${flags[@]}" "${available[@]}"
+  ok "installed: ${available[*]}"
+else
+  warn "skipping pacman; make sure these are installed: ${packages[*]}"
+fi
+
+# ---------------------------------------------------------------- pyicloud
+
+if want reminders; then
+  step "pyicloud $ABRIDGE_PYICLOUD_VERSION (Reminders, and \`abridge icloud\`)"
+  # An Arch Python upgrade (3.13 -> 3.14) leaves a venv pointing at a
+  # library that no longer exists. Rebuild instead of trying to repair it.
+  if ! "$ABRIDGE_VENV/bin/python" -c 'import pyicloud' >/dev/null 2>&1; then
+    rm -rf "$ABRIDGE_VENV"
+    python3 -m venv "$ABRIDGE_VENV"
+  fi
+  # The [cli] extra is not optional in practice: pyicloud 2.7.0 imports rich
+  # at module load, so a bare install cannot even be imported.
+  "$ABRIDGE_VENV/bin/pip" install -q --upgrade pip
+  "$ABRIDGE_VENV/bin/pip" install -q "pyicloud[cli]==$ABRIDGE_PYICLOUD_VERSION"
+  "$ABRIDGE_VENV/bin/icloud" --version >/dev/null || die "pyicloud did not install cleanly"
+  ok "$("$ABRIDGE_VENV/bin/icloud" --version | tr -d '\n') in $ABRIDGE_VENV"
+fi
+
+# --------------------------------------------------------------- icloud-md
+
+if want notes; then
+  step "icloud-md $ABRIDGE_ICLOUD_MD_VERSION (Notes)"
+  have node || die "node is not installed"
+  node -e 'process.exit(+process.versions.node.split(".")[0] >= 20 ? 0 : 1)' \
+    || die "icloud-md needs Node.js 20 or newer"
+  # A private prefix: no sudo, no clash with anything else installed globally.
+  npm install -g --prefix "$ABRIDGE_NODE_PREFIX" --no-fund --no-audit --loglevel=error \
+    "icloud-md@$ABRIDGE_ICLOUD_MD_VERSION"
+  [ -x "$ABRIDGE_NODE_PREFIX/bin/icloud-md" ] || die "icloud-md did not install"
+  ok "icloud-md in $ABRIDGE_NODE_PREFIX"
+  have chromium || warn "no system chromium; icloud-md will download its own browser (~150 MB) at sign-in"
+fi
+
+# --------------------------------------------------------------- localsend
+
+if want localsend; then
+  step "LocalSend (fast file transfer; the iPhone app is free on the App Store)"
+  if have localsend_app || have localsend || pacman -Q localsend-bin >/dev/null 2>&1; then
+    ok "already installed"
+  elif have paru; then
+    paru -S --needed localsend-bin
+  elif have yay; then
+    yay -S --needed localsend-bin
+  elif have flatpak; then
+    flatpak install -y flathub org.localsend.localsend_app
+  else
+    warn "no AUR helper or flatpak found. Install localsend-bin from the AUR yourself"
+  fi
+fi
+
+# ---------------------------------------------------------------- abridge
+
+step "The abridge command"
+mkdir -p "$HOME/.local/bin" "$ABRIDGE_CONFIG_DIR" "$ABRIDGE_DATA_DIR" "$ABRIDGE_STATE_DIR"
+ln -sfn "$REPO/bin/abridge" "$HOME/.local/bin/abridge"
+ok "linked ~/.local/bin/abridge -> $REPO/bin/abridge"
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) warn "$HOME/.local/bin is not on your PATH. Add to your shell rc: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+esac
+
+if want usb; then
+  # usbmuxd starts from a udev rule when the phone is plugged in; nothing to
+  # enable. Pairing needs the phone unlocked, so it is a later step.
+  ok "usb: plug the phone in, unlock it, then run: abridge usb pair"
+fi
+
+cat <<EOF
+
+${_b}Next steps${_n}
+  abridge init                 your Apple ID and notes folder
+  abridge setup calendar       Calendar + Contacts (needs an app-specific password)
+  abridge setup reminders      Reminders (Apple ID password + 2FA code)
+  abridge setup notes          Notes, as Markdown files in a git repo
+  abridge timer on             keep them in sync every 15 minutes
+  abridge airdrop check        can this laptop's Wi-Fi do AirDrop?
+  abridge doctor               see what works
+EOF

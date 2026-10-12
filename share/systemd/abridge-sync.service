@@ -1,0 +1,7 @@
+[Unit]
+Description=apple-bridge: sync iCloud calendars, contacts, reminders and notes
+
+[Service]
+Type=oneshot
+# @ABRIDGE@ is replaced with the full path by `abridge timer on`.
+ExecStart=@ABRIDGE@ sync

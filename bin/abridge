@@ -1,0 +1,687 @@
+#!/bin/bash
+# abridge - make an iPhone and iCloud work with Arch Linux.
+#
+# One front end over maintained open-source tools:
+#   calendar, contacts  vdirsyncer + khal/khard over iCloud CalDAV/CardDAV
+#   reminders           pyicloud (private CloudKit API) + a VTODO mirror
+#   notes               icloud-md (private CloudKit API), as Markdown in git
+#   airdrop             patched OWL + OpenDrop (airdrop-mt7921)
+#   usb                 libimobiledevice + ifuse
+# Run `abridge help` for the commands.
+set -euo pipefail
+
+ABRIDGE_ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$ABRIDGE_ROOT/lib/common.sh"
+load_config
+
+VDIRSYNCER_CONF="$ABRIDGE_CONFIG_DIR/vdirsyncer.conf"
+KHAL_CONF="$ABRIDGE_CONFIG_DIR/khal.conf"
+KHARD_CONF="$ABRIDGE_CONFIG_DIR/khard.conf"
+TODOMAN_CONF="$ABRIDGE_CONFIG_DIR/todoman.py"
+ICLOUD_BIN="$ABRIDGE_VENV/bin/icloud"
+ICLOUD_MD_BIN="$ABRIDGE_NODE_PREFIX/bin/icloud-md"
+AIRDROP_DIR="$ABRIDGE_SRC_DIR/airdrop-mt7921"
+
+# icloud-md signs in through a Playwright browser. Arch is not a distro
+# Playwright supports, so prefer the system Chromium when there is one.
+if [ -z "${ICLOUD_MD_BROWSER_EXECUTABLE:-}" ] && [ -x /usr/bin/chromium ]; then
+  export ICLOUD_MD_BROWSER_EXECUTABLE=/usr/bin/chromium
+fi
+
+usage() {
+  cat <<'EOF'
+abridge - iPhone and iCloud on Arch Linux
+
+Setup
+  abridge init                     set your Apple ID and folders
+  abridge setup calendar [--no-contacts]
+                                   iCloud Calendar (+ Contacts) via CalDAV/CardDAV
+  abridge setup reminders          sign in to iCloud for Reminders (password + 2FA)
+  abridge setup notes              clone your Notes into NOTES_DIR as Markdown
+  abridge timer on|off|status      sync every 15 minutes in the background
+  abridge doctor                   check what is installed and signed in
+
+Everyday
+  abridge sync                     sync everything that is set up
+  abridge cal [khal args]          calendar (default: next 7 days)
+  abridge contacts [khard args]    contacts (default: list)
+  abridge rem lists                reminder lists
+  abridge rem ls [LIST] [-a]       reminders (-a: include completed)
+  abridge rem add LIST TITLE [-d DUE] [-n NOTES] [-p high|medium|low] [-f]
+  abridge rem done|undo|rm ID...   ID = the short id shown by `rem ls`
+  abridge todo [todoman args]      read-only view of the reminders mirror
+  abridge notes pull|push|status   sync NOTES_DIR (git commits around each step)
+  abridge notes <icloud-md args>   anything else icloud-md can do
+
+Phone
+  abridge airdrop check            is this Wi-Fi card able to do AirDrop?
+  abridge airdrop install          build OWL + patched OpenDrop (asks for sudo)
+  abridge airdrop receive          receive (phone: AirDrop "Everyone for 10 Minutes")
+  abridge airdrop send [--to NAME] FILE...
+  abridge usb pair|info            trust this computer / show the phone
+  abridge usb photos DEST          copy new photos and videos (DCIM) to DEST
+  abridge usb backup DEST          full local backup (idevicebackup2)
+  abridge usb encrypt              turn on encrypted backups (asks for a password)
+  abridge usb mount DIR|umount DIR browse the phone's media folder
+
+Low level
+  abridge icloud ARGS...           pyicloud's own CLI, with the persistent session
+  abridge secret set|get           the app-specific password used for CalDAV
+EOF
+}
+
+# ------------------------------------------------------------------ config
+
+cmd_init() {
+  mkdir -p "$ABRIDGE_CONFIG_DIR"
+  local id notes
+  read -r -p "Apple ID (email) [${APPLE_ID:-}]: " id
+  id="${id:-${APPLE_ID:-}}"
+  [ -n "$id" ] || die "an Apple ID is required"
+  check_plain "Apple ID" "$id"
+  read -r -p "Folder for your notes [$NOTES_DIR]: " notes
+  notes="${notes:-$NOTES_DIR}"
+  check_plain "notes folder" "$notes"
+  umask 077
+  cat >"$ABRIDGE_CONFIG" <<EOF
+# apple-bridge settings, sourced by abridge. Re-run \`abridge init\` to change.
+APPLE_ID="$id"
+NOTES_DIR="$notes"
+# Where synced data lives. Change these before the first sync, not after.
+#CALENDAR_DIR="$CALENDAR_DIR"
+#CONTACTS_DIR="$CONTACTS_DIR"
+#REMINDERS_DIR="$REMINDERS_DIR"
+EOF
+  ok "wrote $ABRIDGE_CONFIG"
+}
+
+# ------------------------------------------------------------------ secret
+# The app-specific password for CalDAV/CardDAV. Prefer the desktop keyring
+# (gnome-keyring, KeePassXC); fall back to a 0600 file when there is none.
+
+secret_get() {
+  require_apple_id
+  if have secret-tool; then
+    secret-tool lookup service apple-bridge kind app-password account "$APPLE_ID" 2>/dev/null && return 0
+  fi
+  [ -r "$ABRIDGE_APP_PASSWORD_FILE" ] && { cat "$ABRIDGE_APP_PASSWORD_FILE"; return 0; }
+  return 1
+}
+
+secret_set() {
+  require_apple_id
+  cat >&2 <<'EOF'
+Calendar and Contacts use an app-specific password, not your Apple ID password:
+  1. Open https://account.apple.com and sign in.
+  2. Sign-In and Security -> App-Specific Passwords -> +  (name it "Arch")
+  3. Paste the xxxx-xxxx-xxxx-xxxx password below.
+EOF
+  local pw
+  read -r -s -p "App-specific password: " pw; echo >&2
+  pw="${pw// /}"
+  [ -n "$pw" ] || die "no password given"
+  [[ "$pw" =~ ^[a-z]{4}-[a-z]{4}-[a-z]{4}-[a-z]{4}$ ]] \
+    || warn "that does not look like an app-specific password (xxxx-xxxx-xxxx-xxxx)"
+  if have secret-tool && printf '%s' "$pw" | secret-tool store \
+      --label="apple-bridge: iCloud app-specific password" \
+      service apple-bridge kind app-password account "$APPLE_ID" 2>/dev/null; then
+    rm -f "$ABRIDGE_APP_PASSWORD_FILE"
+    ok "stored in your keyring"
+  else
+    warn "no keyring service is running; storing it in $ABRIDGE_APP_PASSWORD_FILE (mode 600)"
+    mkdir -p "$ABRIDGE_CONFIG_DIR"
+    (umask 077; printf '%s\n' "$pw" >"$ABRIDGE_APP_PASSWORD_FILE")
+  fi
+}
+
+cmd_secret() {
+  case "${1:-}" in
+    set) secret_set ;;
+    get) secret_get || die "no app-specific password stored. Run: abridge secret set" ;;
+    *) die "usage: abridge secret set|get" ;;
+  esac
+}
+
+# ---------------------------------------------------------- calendar/contacts
+
+render_vdirsyncer_config() {
+  local contacts="$1"
+  check_plain CALENDAR_DIR "$CALENDAR_DIR"
+  check_plain CONTACTS_DIR "$CONTACTS_DIR"
+  check_plain ABRIDGE_ROOT "$ABRIDGE_ROOT"
+  cat <<EOF
+# Written by \`abridge setup calendar\`; re-running it overwrites this file.
+[general]
+status_path = "$ABRIDGE_STATE_DIR/vdirsyncer/"
+
+[pair icloud_calendar]
+a = "icloud_calendar_local"
+b = "icloud_calendar_remote"
+collections = ["from b"]
+metadata = ["color", "displayname"]
+# On a conflict the iPhone's version wins.
+conflict_resolution = "b wins"
+
+[storage icloud_calendar_local]
+type = "filesystem"
+path = "$CALENDAR_DIR/"
+fileext = ".ics"
+
+[storage icloud_calendar_remote]
+type = "caldav"
+url = "https://caldav.icloud.com/"
+username = "$APPLE_ID"
+password.fetch = ["command", "$ABRIDGE_ROOT/bin/abridge", "secret", "get"]
+# Events only. Upgraded Reminders are not on CalDAV (see docs/reminders.md);
+# all CalDAV still has is a stub list that says "Where are my reminders?".
+item_types = ["VEVENT"]
+EOF
+  [ "$contacts" = 1 ] || return 0
+  cat <<EOF
+
+[pair icloud_contacts]
+a = "icloud_contacts_local"
+b = "icloud_contacts_remote"
+collections = ["from b"]
+conflict_resolution = "b wins"
+
+[storage icloud_contacts_local]
+type = "filesystem"
+path = "$CONTACTS_DIR/"
+fileext = ".vcf"
+
+[storage icloud_contacts_remote]
+type = "carddav"
+url = "https://contacts.icloud.com/"
+username = "$APPLE_ID"
+password.fetch = ["command", "$ABRIDGE_ROOT/bin/abridge", "secret", "get"]
+EOF
+}
+
+write_khal_config() {
+  cat >"$KHAL_CONF" <<EOF
+# Written by abridge. Copy it to ~/.config/khal/config to use plain \`khal\`.
+[calendars]
+[[icloud]]
+path = $CALENDAR_DIR/*
+type = discover
+EOF
+}
+
+# khard has no glob for address books, so list whatever vdirsyncer created.
+write_khard_config() {
+  {
+    echo "# Written by abridge on every run."
+    echo "[addressbooks]"
+    local d
+    for d in "$CONTACTS_DIR"/*/; do
+      [ -d "$d" ] || continue
+      printf '[[%s]]\npath = %s\n' "$(basename "$d")" "${d%/}"
+    done
+  } >"$KHARD_CONF"
+}
+
+vdirsyncer_run() {
+  VDIRSYNCER_CONFIG="$VDIRSYNCER_CONF" vdirsyncer "$@"
+}
+
+setup_calendar() {
+  require_apple_id
+  have vdirsyncer || die "vdirsyncer is not installed. Run install.sh"
+  local contacts=1
+  [ "${1:-}" = --no-contacts ] && contacts=0
+  secret_get >/dev/null 2>&1 || secret_set
+  mkdir -p "$ABRIDGE_CONFIG_DIR" "$CALENDAR_DIR" "$ABRIDGE_STATE_DIR/vdirsyncer"
+  [ "$contacts" = 1 ] && mkdir -p "$CONTACTS_DIR"
+  render_vdirsyncer_config "$contacts" >"$VDIRSYNCER_CONF"
+  ok "wrote $VDIRSYNCER_CONF"
+  if [ "$contacts" = 1 ]; then step "Finding your iCloud calendars and address books"
+  else step "Finding your iCloud calendars"; fi
+  echo "vdirsyncer asks before creating each local folder; answer y." >&2
+  vdirsyncer_run discover
+  vdirsyncer_run metasync
+  step "First sync (can take a minute)"
+  vdirsyncer_run sync
+  write_khal_config
+  [ "$contacts" = 1 ] && write_khard_config
+  ok "done. Try: abridge cal"
+}
+
+cmd_cal() {
+  [ -f "$KHAL_CONF" ] || die "calendar is not set up. Run: abridge setup calendar"
+  have khal || die "khal is not installed. Run install.sh"
+  if [ $# = 0 ]; then set -- list today 7d; fi
+  khal -c "$KHAL_CONF" "$@"
+}
+
+cmd_contacts() {
+  [ -d "$CONTACTS_DIR" ] || die "contacts are not set up. Run: abridge setup calendar"
+  have khard || die "khard is not installed. Run install.sh"
+  write_khard_config
+  if [ $# = 0 ]; then set -- list; fi
+  khard -c "$KHARD_CONF" "$@"
+}
+
+# --------------------------------------------------------------- reminders
+
+icloud_cli() {
+  [ -x "$ICLOUD_BIN" ] || die "pyicloud is not installed. Run install.sh"
+  "$ICLOUD_BIN" "$@"
+}
+
+# pyicloud's options belong to each leaf command, so add ours at the end,
+# except when the user is just asking for help or the version.
+cmd_icloud() {
+  local a
+  for a in "$@"; do
+    case "$a" in -h|--help|--version) icloud_cli "$@"; return ;; esac
+  done
+  [ $# -ge 1 ] || { icloud_cli --help; return; }
+  require_apple_id
+  mkdir -p "$ABRIDGE_PYICLOUD_SESSION"
+  icloud_cli "$@" --username "$APPLE_ID" --session-dir "$ABRIDGE_PYICLOUD_SESSION"
+}
+
+reminders_helper() {
+  [ -x "$ABRIDGE_VENV/bin/python" ] || die "pyicloud is not installed. Run install.sh"
+  require_apple_id
+  APPLE_ID="$APPLE_ID" ABRIDGE_PYICLOUD_SESSION="$ABRIDGE_PYICLOUD_SESSION" \
+    REMINDERS_DIR="$REMINDERS_DIR" \
+    "$ABRIDGE_VENV/bin/python" "$ABRIDGE_ROOT/libexec/abridge-reminders" "$@"
+}
+
+reminders_ready() {
+  [ -n "$(ls -A "$ABRIDGE_PYICLOUD_SESSION" 2>/dev/null)" ]
+}
+
+setup_reminders() {
+  require_apple_id
+  cat >&2 <<'EOF'
+Reminders needs your real Apple ID password and a 2FA code: Apple's CloudKit
+service rejects app-specific passwords. The session is saved locally and lasts
+roughly two months; after that, run this again.
+
+When asked "Save password in keyring?", answer n unless gnome-keyring or
+KeePassXC is running: without one, Python's keyring may fall back to a
+plain-text file.
+EOF
+  cmd_icloud auth login
+  write_todoman_config
+  step "Mirroring reminders to $REMINDERS_DIR"
+  reminders_helper mirror
+}
+
+write_todoman_config() {
+  mkdir -p "$ABRIDGE_CONFIG_DIR"
+  cat >"$TODOMAN_CONF" <<EOF
+# Written by abridge. A read-only mirror: change reminders with \`abridge rem\`,
+# because the next sync overwrites edits made here.
+path = "$REMINDERS_DIR/*"
+date_format = "%Y-%m-%d"
+time_format = "%H:%M"
+EOF
+}
+
+cmd_todo() {
+  have todo || die "todoman is not installed. Run install.sh"
+  [ -f "$TODOMAN_CONF" ] || write_todoman_config
+  if [ $# = 0 ]; then set -- list; fi
+  todo --config "$TODOMAN_CONF" "$@"
+}
+
+cmd_rem() {
+  case "${1:-}" in
+    ""|-h|--help) reminders_helper --help ;;
+    *) reminders_helper "$@" ;;
+  esac
+}
+
+# ------------------------------------------------------------------- notes
+
+icloud_md() {
+  [ -x "$ICLOUD_MD_BIN" ] || die "icloud-md is not installed. Run install.sh"
+  "$ICLOUD_MD_BIN" "$@"
+}
+
+notes_ready() { [ -d "$NOTES_DIR/.icloud-md" ]; }
+
+# Every pull and push is bracketed by commits, so any bad sync is one
+# `git revert` away. icloud-md's own README asks for exactly this.
+notes_commit() {
+  local msg="$1"
+  git -C "$NOTES_DIR" config user.email >/dev/null 2>&1 \
+    || git -C "$NOTES_DIR" config user.email "apple-bridge@localhost"
+  git -C "$NOTES_DIR" config user.name >/dev/null 2>&1 \
+    || git -C "$NOTES_DIR" config user.name "apple-bridge"
+  git -C "$NOTES_DIR" add -A
+  git -C "$NOTES_DIR" diff --cached --quiet || git -C "$NOTES_DIR" commit -q -m "$msg"
+}
+
+setup_notes() {
+  have git || die "git is not installed"
+  if notes_ready; then ok "$NOTES_DIR is already a notes vault"; return; fi
+  [ ! -e "$NOTES_DIR" ] || [ -z "$(ls -A "$NOTES_DIR")" ] \
+    || die "$NOTES_DIR exists and is not empty. Pick another folder with: abridge init"
+  cat >&2 <<'EOF'
+A browser window opens on icloud.com: sign in there (password, 2FA). It
+closes by itself when it is done. Notes needs Advanced Data Protection OFF,
+or at least "Access iCloud Data on the Web" ON, on your iPhone.
+EOF
+  local flags=()
+  if confirm "Obsidian-style vault (the file name is the note title)?" n; then
+    flags+=(--filename-as-title)
+  fi
+  mkdir -p "$(dirname "$NOTES_DIR")"
+  icloud_md clone "$NOTES_DIR" "${flags[@]}"
+  git -C "$NOTES_DIR" init -q
+  printf '.icloud-md/\n' >"$NOTES_DIR/.gitignore"
+  notes_commit "Clone from iCloud"
+  ok "your notes are in $NOTES_DIR"
+}
+
+notes_pull() {
+  notes_ready || die "notes are not set up. Run: abridge setup notes"
+  # Check first: a stale session would otherwise open a sign-in window,
+  # which a background timer has no way to show.
+  if ! icloud_md verify-auth "$NOTES_DIR" >/dev/null 2>&1; then
+    warn "the Notes sign-in has expired. Run: abridge notes reauthenticate"
+    return 1
+  fi
+  # Explicit returns: callers use `notes_pull || ...`, which turns set -e off.
+  notes_commit "Local edits before pull" || return 1
+  icloud_md pull "$NOTES_DIR" || return 1
+  notes_commit "Pull from iCloud"
+}
+
+notes_push() {
+  notes_ready || die "notes are not set up. Run: abridge setup notes"
+  notes_commit "Local edits before push" || return 1
+  icloud_md push "$NOTES_DIR" "$@" || return 1
+  notes_commit "After push"
+}
+
+cmd_notes() {
+  case "${1:-}" in
+    clone) setup_notes ;;
+    pull) notes_pull ;;
+    push) shift; notes_push "$@" ;;
+    status) icloud_md status "$NOTES_DIR" ;;
+    ""|-h|--help) icloud_md --help ;;
+    *) (cd "$NOTES_DIR" && icloud_md "$@") ;;
+  esac
+}
+
+# ----------------------------------------------------------------- airdrop
+
+wifi_drivers() {
+  local dev
+  for dev in /sys/class/net/*; do
+    [ -d "$dev/wireless" ] || [ -d "$dev/phy80211" ] || continue
+    printf '%s %s\n' "$(basename "$dev")" "$(basename "$(readlink -f "$dev/device/driver" 2>/dev/null || echo unknown)")"
+  done
+}
+
+airdrop_check() {
+  local found=0 iface driver
+  while read -r iface driver; do
+    found=1
+    case "$driver" in
+      mt7921e|mt7921u|mt7921s)
+        ok "$iface ($driver): supported, tested with iOS 26 by airdrop-mt7921" ;;
+      ath9k|ath9k_htc)
+        warn "$iface ($driver): OWL's original target. AWDL works, but this wrapper's patches were only tested on MT7921/MT7922" ;;
+      *)
+        warn "$iface ($driver): cannot do AirDrop. It needs active monitor mode with frame injection. Use LocalSend, or an Atheros AR9271 USB adapter" ;;
+    esac
+  done < <(wifi_drivers)
+  [ "$found" = 1 ] || warn "no Wi-Fi interface found"
+}
+
+cmd_airdrop() {
+  local sub="${1:-}"
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    check) airdrop_check ;;
+    install)
+      airdrop_check
+      have git || die "git is not installed"
+      mkdir -p "$ABRIDGE_SRC_DIR"
+      if [ ! -d "$AIRDROP_DIR/.git" ]; then
+        git clone -q "$ABRIDGE_AIRDROP_REPO" "$AIRDROP_DIR"
+      fi
+      git -C "$AIRDROP_DIR" fetch -q origin
+      git -C "$AIRDROP_DIR" -c advice.detachedHead=false checkout -q "$ABRIDGE_AIRDROP_REF"
+      ok "airdrop-mt7921 at ${ABRIDGE_AIRDROP_REF:0:7}"
+      cat >&2 <<'EOF'
+Its installer builds OWL and a patched OpenDrop, installs a root-owned helper
+in /usr/local/bin and, after asking, one passwordless sudo rule for it
+(/etc/sudoers.d/zz-airdrop). Read its daemon/README.md#security first if
+you want to know why.
+EOF
+      (cd "$AIRDROP_DIR" && ./install.sh)
+      ;;
+    receive)
+      [ -x "$AIRDROP_DIR/airdrop.sh" ] || die "run: abridge airdrop install"
+      echo "Phone: AirDrop -> Everyone for 10 Minutes, open the share sheet, pick this laptop." >&2
+      echo "Wi-Fi is off while this runs and comes back afterwards." >&2
+      (cd "$AIRDROP_DIR" && ACTIVE=1 ./airdrop.sh receive)
+      ;;
+    send)
+      [ -x "$AIRDROP_DIR/airdrop.sh" ] || die "run: abridge airdrop install"
+      local receiver=""
+      if [ "${1:-}" = --to ]; then receiver="${2:-}"; shift 2 || die "--to needs a name"; fi
+      [ $# -gt 0 ] || die "usage: abridge airdrop send [--to NAME] FILE..."
+      local files=() f
+      for f in "$@"; do
+        [ -f "$f" ] || die "not a file: $f"
+        files+=("$(readlink -f "$f")")
+      done
+      echo "Phone: unlocked, share sheet CLOSED, AirDrop on Everyone for 10 Minutes." >&2
+      (cd "$AIRDROP_DIR" && RECEIVER="$receiver" ACTIVE=1 ./airdrop.sh send "${files[@]}")
+      ;;
+    *) die "usage: abridge airdrop check|install|receive|send [--to NAME] FILE..." ;;
+  esac
+}
+
+# --------------------------------------------------------------------- usb
+
+unmount_fuse() {
+  if have fusermount3; then fusermount3 -u "$1"
+  elif have fusermount; then fusermount -u "$1"
+  else umount "$1"; fi
+}
+
+need_phone() {
+  have idevice_id || die "libimobiledevice is not installed. Run install.sh"
+  [ -n "$(idevice_id -l 2>/dev/null)" ] \
+    || die "no iPhone found. Plug it in, unlock it and tap Trust (then: abridge usb pair)"
+}
+
+cmd_usb() {
+  local sub="${1:-}"
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    pair)
+      need_phone
+      echo "Unlock the phone and tap Trust when it asks." >&2
+      idevicepair pair && idevicepair validate
+      ;;
+    info)
+      need_phone
+      ideviceinfo | grep -E '^(DeviceName|ProductType|ProductVersion|BuildVersion):' || true
+      ;;
+    photos)
+      local dest="${1:-}"
+      [ -n "$dest" ] || die "usage: abridge usb photos DEST"
+      need_phone
+      have ifuse || die "ifuse is not installed. Run install.sh"
+      mkdir -p "$dest"
+      local mnt
+      mnt="$(mktemp -d)"
+      ifuse "$mnt"
+      # shellcheck disable=SC2064  # expand now: $mnt is local
+      trap "unmount_fuse '$mnt'; rmdir '$mnt'" EXIT
+      [ -d "$mnt/DCIM" ] || die "no DCIM folder on the phone"
+      rsync -rt --ignore-existing --info=progress2 "$mnt/DCIM/" "$dest/"
+      ok "copied new files to $dest (HEIC photos need libheif to view)"
+      ;;
+    backup)
+      local dest="${1:-}"
+      [ -n "$dest" ] || die "usage: abridge usb backup DEST"
+      need_phone
+      mkdir -p "$dest"
+      idevicebackup2 backup --full "$dest"
+      ;;
+    encrypt)
+      need_phone
+      idevicebackup2 -i encryption on
+      ;;
+    mount)
+      [ -n "${1:-}" ] || die "usage: abridge usb mount DIR"
+      need_phone
+      mkdir -p "$1"
+      ifuse "$1"
+      ok "mounted on $1 (unmount: abridge usb umount $1)"
+      ;;
+    umount)
+      [ -n "${1:-}" ] || die "usage: abridge usb umount DIR"
+      unmount_fuse "$1"
+      ;;
+    *) die "usage: abridge usb pair|info|photos DEST|backup DEST|encrypt|mount DIR|umount DIR" ;;
+  esac
+}
+
+# -------------------------------------------------------------------- sync
+
+cmd_sync() {
+  local failed=0 any=0
+  if [ -f "$VDIRSYNCER_CONF" ]; then
+    any=1
+    step "Calendar and contacts"
+    { vdirsyncer_run metasync && vdirsyncer_run sync; } || { warn "vdirsyncer failed"; failed=1; }
+  fi
+  if reminders_ready; then
+    any=1
+    step "Reminders"
+    reminders_helper mirror || { warn "reminders mirror failed"; failed=1; }
+  fi
+  if notes_ready; then
+    any=1
+    step "Notes"
+    notes_pull || failed=1
+  fi
+  [ "$any" = 1 ] || warn "nothing is set up yet. Start with: abridge setup calendar"
+  return "$failed"
+}
+
+# ------------------------------------------------------------------- timer
+
+cmd_timer() {
+  local unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  case "${1:-status}" in
+    on)
+      mkdir -p "$unit_dir"
+      sed "s|@ABRIDGE@|$ABRIDGE_ROOT/bin/abridge|" \
+        "$ABRIDGE_ROOT/share/systemd/abridge-sync.service" >"$unit_dir/abridge-sync.service"
+      cp "$ABRIDGE_ROOT/share/systemd/abridge-sync.timer" "$unit_dir/abridge-sync.timer"
+      systemctl --user daemon-reload
+      systemctl --user enable --now abridge-sync.timer
+      ok "syncing every 15 minutes. Logs: journalctl --user -u abridge-sync"
+      ;;
+    off) systemctl --user disable --now abridge-sync.timer ;;
+    status) systemctl --user list-timers abridge-sync.timer --no-pager ;;
+    *) die "usage: abridge timer on|off|status" ;;
+  esac
+}
+
+# ------------------------------------------------------------------ doctor
+
+cmd_doctor() {
+  local t
+  step "Config"
+  if [ -n "${APPLE_ID:-}" ]; then ok "Apple ID $APPLE_ID"; else warn "no Apple ID. Run: abridge init"; fi
+
+  step "Tools"
+  for t in vdirsyncer khal khard todo secret-tool git idevice_id ifuse rsync; do
+    if have "$t"; then ok "$t"; else warn "$t missing"; fi
+  done
+  if [ -x "$ICLOUD_BIN" ]; then ok "pyicloud $("$ICLOUD_BIN" --version 2>/dev/null | tr -d '\n')"; else warn "pyicloud missing"; fi
+  if [ -x "$ICLOUD_MD_BIN" ]; then ok "icloud-md $("$ICLOUD_MD_BIN" --version 2>/dev/null | tr -d '\n')"; else warn "icloud-md missing"; fi
+  if have localsend_app || have localsend || flatpak info org.localsend.localsend_app >/dev/null 2>&1; then
+    ok "LocalSend"
+  else
+    warn "LocalSend missing (optional, the fast way to move files)"
+  fi
+
+  step "Calendar and contacts"
+  if [ -f "$VDIRSYNCER_CONF" ]; then ok "configured"; else warn "not set up (abridge setup calendar)"; fi
+  if [ -f "$VDIRSYNCER_CONF" ] && [ -n "${APPLE_ID:-}" ]; then
+    if (secret_get) >/dev/null 2>&1; then ok "app-specific password found"; else warn "app-specific password missing (abridge secret set)"; fi
+  fi
+
+  step "Reminders"
+  if reminders_ready && [ -n "${APPLE_ID:-}" ]; then
+    if (cmd_icloud auth status --format json) 2>/dev/null | grep -q '"authenticated": true'; then
+      ok "signed in"
+    else
+      warn "session expired (abridge setup reminders)"
+    fi
+  else
+    warn "not set up (abridge setup reminders)"
+  fi
+
+  step "Notes"
+  if notes_ready; then
+    if icloud_md verify-auth "$NOTES_DIR" >/dev/null 2>&1; then ok "$NOTES_DIR, signed in"; else warn "sign-in expired (abridge notes reauthenticate)"; fi
+  else
+    warn "not set up (abridge setup notes)"
+  fi
+
+  step "iPhone over USB"
+  if have idevice_id && [ -n "$(idevice_id -l 2>/dev/null)" ]; then ok "connected"; else warn "not connected (optional)"; fi
+  if have systemctl && ! systemctl is-active --quiet usbmuxd 2>/dev/null; then
+    warn "usbmuxd is not running (it starts when the phone is plugged in)"
+  fi
+
+  step "AirDrop"
+  airdrop_check
+  if [ -x "$AIRDROP_DIR/airdrop.sh" ]; then ok "installed"; else warn "not installed (abridge airdrop install)"; fi
+
+  step "Background sync"
+  if systemctl --user is-enabled --quiet abridge-sync.timer 2>/dev/null; then ok "timer on"; else warn "timer off (abridge timer on)"; fi
+}
+
+# -------------------------------------------------------------------- main
+
+main() {
+  local cmd="${1:-help}"
+  [ $# -gt 0 ] && shift
+  case "$cmd" in
+    init) cmd_init ;;
+    setup)
+      case "${1:-}" in
+        calendar) shift; setup_calendar "$@" ;;
+        reminders) setup_reminders ;;
+        notes) setup_notes ;;
+        *) die "usage: abridge setup calendar|reminders|notes" ;;
+      esac
+      ;;
+    sync) cmd_sync ;;
+    cal|calendar) cmd_cal "$@" ;;
+    contacts) cmd_contacts "$@" ;;
+    rem|reminders) cmd_rem "$@" ;;
+    todo) cmd_todo "$@" ;;
+    notes) cmd_notes "$@" ;;
+    airdrop) cmd_airdrop "$@" ;;
+    usb) cmd_usb "$@" ;;
+    icloud) cmd_icloud "$@" ;;
+    secret) cmd_secret "$@" ;;
+    timer) cmd_timer "$@" ;;
+    doctor) cmd_doctor ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"
