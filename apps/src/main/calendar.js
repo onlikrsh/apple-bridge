@@ -68,6 +68,8 @@ function recurData(vevent) {
     interval: rrule.interval || 1,
     count: rrule.count || null,
     until: rrule.until ? (rrule.until.isDate ? dateString(rrule.until) : rrule.until.toJSDate().toISOString()) : null,
+    // BYDAY, BYMONTHDAY and friends: more than the Repeat menu can show or write.
+    custom: Object.keys(rrule.parts || {}).length > 0,
   };
 }
 

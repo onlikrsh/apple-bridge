@@ -126,3 +126,98 @@ test('notes: switching notes saves first; search finds body text', { skip }, asy
     await s.done();
   }
 });
+
+// ------------------------------------------------------------------ calendar
+
+const icsFiles = (dir) => fs.readdirSync(dir).filter((f) => f.endsWith('.ics'));
+
+test('calendar: double-click creates, the inspector edits, drag moves', { skip }, async () => {
+  const s = await start('calendar');
+  try {
+    const { page } = s;
+    const cals = path.join(s.fixture, 'calendars');
+    await page.waitForSelector('.tg-grid');
+    await page.locator('.segmented button', { hasText: 'Week' }).click();
+    const homeBefore = icsFiles(path.join(cals, 'home'));
+
+    // Double-click an empty slot in the first column: a new event in Home.
+    await page.locator('.tg-scroll').evaluate((el) => (el.scrollTop = 0));
+    await page.waitForTimeout(100);
+    const col = page.locator('.tg-col').first();
+    const box = await col.boundingBox();
+    await page.mouse.dblclick(box.x + box.width / 2, box.y + 48 * 2 + 10); // ~2 AM
+    await page.locator('.insp-title').fill('Write the release notes');
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(600);
+    const created = icsFiles(path.join(cals, 'home')).filter((f) => !homeBefore.includes(f));
+    assert.equal(created.length, 1);
+    const ics = read(path.join(cals, 'home', created[0]));
+    assert.match(ics, /SUMMARY:Write the release notes/);
+    assert.match(ics, /PRODID:-\/\/apple-bridge\/\/Calendar\/\/EN/);
+    assert.match(s.log(), /sync calendar|^$/m);
+
+    // Drag it down one hour.
+    const ev = page.locator('.event', { hasText: 'Write the release notes' });
+    const eb = await ev.boundingBox();
+    await page.mouse.move(eb.x + 10, eb.y + 8);
+    await page.mouse.down();
+    await page.mouse.move(eb.x + 10, eb.y + 30, { steps: 4 });
+    await page.mouse.move(eb.x + 10, eb.y + 56, { steps: 4 });
+    await page.mouse.up();
+    await page.waitForTimeout(600);
+    const before = ics.match(/DTSTART:(\d{8}T\d{6}Z)/)[1];
+    const after = read(path.join(cals, 'home', created[0])).match(/DTSTART:(\d{8}T\d{6}Z)/)[1];
+    assert.notEqual(after, before);
+    assert.equal(Number(after.slice(9, 11)) - Number(before.slice(9, 11)), 1);
+
+    // Open it, set a location and an alert.
+    await page.locator('.event', { hasText: 'Write the release notes' }).click();
+    await page.locator('.insp-plain[placeholder="Add Location"]').fill('Library');
+    await page.locator('.insp-row', { hasText: 'alert:' }).locator('select').selectOption('15');
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(600);
+    const edited = read(path.join(cals, 'home', created[0]));
+    assert.match(edited, /LOCATION:Library/);
+    assert.match(edited, /TRIGGER:-PT15M/);
+
+    // Delete it.
+    await page.locator('.event', { hasText: 'Write the release notes' }).click();
+    await page.locator('button', { hasText: 'Delete Event' }).click();
+    await page.waitForTimeout(500);
+    assert.equal(fs.existsSync(path.join(cals, 'home', created[0])), false);
+  } finally {
+    await s.done();
+  }
+});
+
+test('calendar: repeating events ask before changing the series, and can lose one date', { skip }, async () => {
+  const s = await start('calendar');
+  try {
+    const { page } = s;
+    await page.waitForSelector('.tg-grid');
+    const gymFile = icsFiles(path.join(s.fixture, 'calendars', 'fitness')).find((f) => read(path.join(s.fixture, 'calendars', 'fitness', f)).includes('SUMMARY:Gym'));
+    const gymPath = path.join(s.fixture, 'calendars', 'fitness', gymFile);
+    const count = async () => page.locator('.event', { hasText: 'Gym' }).count();
+    const before = await count();
+    assert.ok(before >= 2);
+
+    // Delete only one occurrence: an EXDATE, the series stays.
+    await page.locator('.event', { hasText: 'Gym' }).nth(1).click();
+    await page.locator('button', { hasText: 'Delete Event' }).click();
+    await page.locator('.alert button', { hasText: 'Delete This Event Only' }).click();
+    await page.waitForTimeout(600);
+    assert.match(read(gymPath), /EXDATE/);
+    assert.equal(await count(), before - 1);
+
+    // Moving the time of a repeating event asks first; Cancel leaves the file alone.
+    const original = read(gymPath);
+    await page.locator('.event', { hasText: 'Gym' }).first().click();
+    await page.locator('.insp-row', { hasText: 'starts:' }).locator('input[type=time]').fill('06:00');
+    await page.keyboard.press('Escape');
+    await page.locator('.alert button', { hasText: 'Cancel' }).click();
+    await page.waitForTimeout(400);
+    assert.equal(read(gymPath), original);
+  } finally {
+    await s.done();
+  }
+});

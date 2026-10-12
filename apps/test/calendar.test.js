@@ -73,7 +73,7 @@ test('repeating events: weekly with an exception and an EXDATE, old daily and ye
     ['2026-10-26T03:30:00.000Z', 'Standup'],
   ]);
   assert.equal(standups[1].exception, true);
-  assert.deepEqual(standups[0].rrule, { freq: 'WEEKLY', interval: 1, count: null, until: null });
+  assert.deepEqual(standups[0].rrule, { freq: 'WEEKLY', interval: 1, count: null, until: null, custom: false });
   assert.equal(evs.filter((e) => e.uid === 'd').length, 31);
   const bday = evs.find((e) => e.uid === 'y');
   assert.deepEqual([bday.start, bday.end, bday.allDay], ['2026-10-03', '2026-10-04', true]);

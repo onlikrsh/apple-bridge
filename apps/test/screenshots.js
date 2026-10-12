@@ -23,6 +23,8 @@ async function launch(app, theme, fixture) {
     env: { ...process.env, HOME: home, ABRIDGE_BIN: path.join(fixture, 'bin', 'abridge'), ABRIDGE_APP_NO_SYNC: '1', ABRIDGE_APP_THEME: theme, DBUS_SESSION_BUS_ADDRESS: 'disabled:' },
   });
   const page = await electronApp.firstWindow();
+  page.on('pageerror', (e) => console.error(`[${app}] page error:`, e.message));
+  page.on('console', (m) => m.type() === 'error' && console.error(`[${app}] console:`, m.text()));
   await page.setViewportSize({ width: 1180, height: 740 });
   await page.emulateMedia({ colorScheme: theme }); // Playwright otherwise pins pages to light
   return { electronApp, page, home };
@@ -41,7 +43,7 @@ const SCENES = {
     await shot('notes-format');
   },
   async calendar(page, shot) {
-    await page.waitForSelector('.cal-grid, .month');
+    await page.waitForSelector('.tg-grid, .month');
     await page.waitForTimeout(500);
     await shot('calendar-week');
     await page.locator('.segmented button', { hasText: 'Month' }).click();
