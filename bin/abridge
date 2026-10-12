@@ -173,7 +173,7 @@ type = "caldav"
 url = "https://caldav.icloud.com/"
 username = "$APPLE_ID"
 password.fetch = ["command", "$ABRIDGE_ROOT/bin/abridge", "secret", "get"]
-# Events only. Upgraded Reminders are not on CalDAV (see docs/reminders.md);
+# Events only. Upgraded Reminders are not on CalDAV (docs/how-it-works.md);
 # all CalDAV still has is a stub list that says "Where are my reminders?".
 item_types = ["VEVENT"]
 EOF
