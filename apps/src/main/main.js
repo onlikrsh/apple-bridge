@@ -351,25 +351,27 @@ function setupReminders() {
       return data;
     }),
   );
+  // Values go in as --opt=value and positionals after `--`, so a title that
+  // starts with a dash ("- buy milk") is never mistaken for an option.
   ipcMain.handle('reminders:add', (_e, r) => {
-    const args = ['add', r.listId, r.title];
-    if (r.due) args.push('--due', r.due);
-    if (r.notes) args.push('--notes', r.notes);
-    if (r.priority && r.priority !== 'none') args.push('--priority', r.priority);
-    if (r.flagged) args.push('--flag');
-    if (r.parentId) args.push('--parent', r.parentId);
-    return mutate(args);
+    const opts = [];
+    if (r.due) opts.push(`--due=${r.due}`);
+    if (r.notes) opts.push(`--notes=${r.notes}`);
+    if (r.priority && r.priority !== 'none') opts.push(`--priority=${r.priority}`);
+    if (r.flagged) opts.push('--flag');
+    if (r.parentId) opts.push(`--parent=${r.parentId}`);
+    return mutate(['add', ...opts, '--', r.listId, r.title]);
   });
   ipcMain.handle('reminders:edit', (_e, r) => {
-    const args = ['edit', r.id];
-    if (r.title !== undefined) args.push('--title', r.title);
-    if (r.notes !== undefined) args.push('--notes', r.notes);
-    if (r.due === null) args.push('--no-due');
-    else if (r.due) args.push('--due', r.due);
-    if (r.priority) args.push('--priority', r.priority);
-    if (r.flagged !== undefined) args.push(r.flagged ? '--flag' : '--no-flag');
-    return mutate(args);
+    const opts = [];
+    if (r.title !== undefined) opts.push(`--title=${r.title}`);
+    if (r.notes !== undefined) opts.push(`--notes=${r.notes}`);
+    if (r.due === null) opts.push('--no-due');
+    else if (r.due) opts.push(`--due=${r.due}`);
+    if (r.priority) opts.push(`--priority=${r.priority}`);
+    if (r.flagged !== undefined) opts.push(r.flagged ? '--flag' : '--no-flag');
+    return mutate(['edit', ...opts, '--', r.id]);
   });
-  ipcMain.handle('reminders:done', (_e, { id, done }) => mutate([done ? 'done' : 'undo', id]));
-  ipcMain.handle('reminders:remove', (_e, id) => mutate(['rm', id]));
+  ipcMain.handle('reminders:done', (_e, { id, done }) => mutate([done ? 'done' : 'undo', '--', id]));
+  ipcMain.handle('reminders:remove', (_e, id) => mutate(['rm', '--', id]));
 }

@@ -238,16 +238,19 @@ test('reminders: tick, add, edit and delete go to iCloud through abridge rem', {
     // Tick "Pay electricity bill".
     await page.locator('.rem-row', { hasText: 'Pay electricity bill' }).locator('.circle').click();
     await page.waitForTimeout(300);
-    assert.ok(calls(s).includes('rem done A1000003-0000-4000-8000-000000000000'), calls(s).join('\n'));
+    assert.ok(calls(s).includes('rem done -- A1000003-0000-4000-8000-000000000000'), calls(s).join('\n'));
 
     // Add to Work with the inline row.
     await page.locator('.list-row', { hasText: 'Work' }).click();
     await page.locator('button[title="New Reminder (Ctrl+N)"]').click();
     await page.keyboard.type('Plan the offsite');
     await page.keyboard.press('Enter');
+    await page.keyboard.type('- buy snacks');
+    await page.keyboard.press('Enter');
     await page.keyboard.press('Escape');
-    await page.waitForTimeout(400);
-    assert.ok(calls(s).includes('rem add L-WORK Plan the offsite'), calls(s).join('\n'));
+    await page.waitForTimeout(600);
+    assert.ok(calls(s).includes('rem add -- L-WORK Plan the offsite'), calls(s).join('\n'));
+    assert.ok(calls(s).includes('rem add -- L-WORK - buy snacks'), calls(s).join('\n'));
 
     // Edit through the info popover: flag it and give it a time.
     const row = page.locator('.rem-row', { hasText: 'Write release notes' });
@@ -258,14 +261,14 @@ test('reminders: tick, add, edit and delete go to iCloud through abridge rem', {
     await page.locator('.info-line', { hasText: 'Flagged' }).locator('.switch').check();
     await page.keyboard.press('Escape');
     await page.waitForTimeout(400);
-    const editCall = calls(s).find((l) => l.startsWith('rem edit A1000010'));
-    assert.match(editCall, / --due \d{4}-\d\d-\d\d 14:30 --flag$/);
+    const editCall = calls(s).find((l) => l.startsWith('rem edit') && l.includes('A1000010'));
+    assert.match(editCall, /^rem edit --due=\d{4}-\d\d-\d\d 14:30 --flag -- A1000010/);
 
     // Delete from the context menu.
     await page.locator('.rem-row', { hasText: 'Review pull request' }).click({ button: 'right' });
     await page.locator('.menu-item', { hasText: 'Delete' }).click();
     await page.waitForTimeout(300);
-    assert.ok(calls(s).includes('rem rm A1000008-0000-4000-8000-000000000000'));
+    assert.ok(calls(s).includes('rem rm -- A1000008-0000-4000-8000-000000000000'));
   } finally {
     await s.done();
   }

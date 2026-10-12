@@ -465,3 +465,12 @@ def test_app_without_electron_says_how_to_get_it(ab):
     if proc.returncode == 0:
         pytest.skip("electron is installed here")
     assert "pacman" in proc.stderr or "dist is missing" in proc.stderr
+
+
+def test_rem_titles_starting_with_a_dash(ab):
+    # What the Reminders app sends: options as --opt=value, positionals after --.
+    ab.run("rem", "add", "--due=2026-10-21", "--", "Shopping", "- buy snacks")
+    call = ab.state()["calls"][-1]["create"]
+    assert (call["title"], call["list_id"], call["all_day"]) == ("- buy snacks", LIST_SHOP, True)
+    ab.run("rem", "edit", "--title=-1 day left", "--", "ab12")
+    assert ab.state()["updated"]["title"] == "-1 day left"
