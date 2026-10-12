@@ -106,7 +106,8 @@ if want notes || want reminders; then
   [ -x "$ABRIDGE_NODE_PREFIX/bin/icloud-md" ] || die "icloud-md did not install"
   ok "icloud-md in $ABRIDGE_NODE_PREFIX"
   # Our fix for paragraphs that freeze Notes on the iPhone (see the patch's
-  # header). npm leaves an installed package alone, so it may be there already.
+  # header). npm reinstalls the package on every run, which drops it; a
+  # package installed some other way may have it already.
   icloud_md_patch="$REPO/share/patches/icloud-md-$ABRIDGE_ICLOUD_MD_VERSION.patch"
   if [ ! -f "$icloud_md_patch" ]; then
     warn "no paragraph fix for icloud-md $ABRIDGE_ICLOUD_MD_VERSION; abridge will refuse to push notes"
